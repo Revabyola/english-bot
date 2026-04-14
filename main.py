@@ -246,25 +246,45 @@ async def start_phrasal_test(query, context):
     test_items = []
     for verb in verbs:
         preps_list = [p.strip() for p in verb['prepositions'].split(',') if p.strip()]
-        if preps_list:
-            chosen_prep = random.choice(preps_list)
+        if not preps_list:
+            continue
             
-            translations = verb['russian'].split(';')
-            correct_rus = ""
-            for t in translations:
-                if chosen_prep in t and '—' in t:
-                    correct_rus = t.split('—')[1].strip()
+        chosen_prep = random.choice(preps_list)
+        
+        # Безопасный разбор переводов
+        translations = verb['russian'].split(';')
+        correct_rus = ""
+        for t in translations:
+            t = t.strip()
+            if chosen_prep in t:
+                # Ищем любой разделитель: — или - или :
+                for sep in ['—', '-', ':']:
+                    if sep in t:
+                        parts = t.split(sep, 1)
+                        if len(parts) > 1:
+                            correct_rus = parts[1].strip()
+                            break
+                if correct_rus:
                     break
-            
-            if correct_rus:
-                test_items.append({
-                    'verb': verb['verb'],
-                    'prep': chosen_prep,
-                    'meaning': correct_rus
-                })
+        
+        # Если перевод не найден — используем заглушку
+        if not correct_rus:
+            correct_rus = f"({chosen_prep})"
+        
+        test_items.append({
+            'verb': verb['verb'],
+            'prep': chosen_prep,
+            'meaning': correct_rus
+        })
     
     if not test_items:
-        await query.edit_message_text("❌ Нет данных для теста. Проверь формат добавленных глаголов!\n\nПример: `look` → `after = присматривать`", reply_markup=get_back_keyboard())
+        await query.edit_message_text(
+            "❌ Нет данных для теста. Проверь формат добавленных глаголов!\n\n"
+            "Пример правильного формата:\n"
+            "`after = присматривать, down = презирать`",
+            reply_markup=get_back_keyboard(),
+            parse_mode='Markdown'
+        )
         return
     
     random.shuffle(test_items)
