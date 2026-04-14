@@ -99,14 +99,15 @@ def get_test_active_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_translation_variants_keyboard(variants, english_word):
+    """Клавиатура с вариантами перевода (использует индексы)."""
     keyboard = []
-    for variant in variants[:6]:
-        keyboard.append([InlineKeyboardButton(variant, callback_data=f"choose_{variant}")])
+    for i, variant in enumerate(variants[:6]):
+        keyboard.append([InlineKeyboardButton(variant, callback_data=f"choose_{i}")])
     keyboard.append([InlineKeyboardButton("✏️ Ввести свой вариант", callback_data="custom_translation")])
     keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_delete_words_keyboard(items, page=0, per_page=5, item_type="word"):
+def get_delete_items_keyboard(items, page=0, per_page=5, item_type="word"):
     """Универсальная клавиатура для удаления слов или фразовых глаголов."""
     keyboard = []
     
@@ -211,7 +212,7 @@ def translate_word(word):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я словарный бот с ИИ-переводчиком.\n\n"
-        "✨ *Новые возможности:*\n"
+        "✨ *Возможности:*\n"
         "• Комментарии в скобках: `behave (вести себя)`\n"
         "• Удаление отдельных слов и фразовых глаголов\n\n"
         "Выбери действие на клавиатуре:",
@@ -326,7 +327,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
         
-    # --- Выбор перевода ---
+    # --- Выбор перевода (ИСПРАВЛЕНО) ---
     elif data == "custom_translation":
         await query.edit_message_text(
             "✏️ Введи свой перевод:",
@@ -335,10 +336,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data['awaiting'] = 'add_word_rus_manual'
         
     elif data.startswith("choose_"):
-        translation = data.replace("choose_", "")
+        try:
+            variant_index = int(data.replace("choose_", ""))
+        except:
+            variant_index = 0
+        
+        translations = context.user_data.get('translation_variants', [])
+        if translations and variant_index < len(translations):
+            translation = translations[variant_index]
+        else:
+            translation = ""
+        
         english = context.user_data.get('temp_eng', '')
         comment = context.user_data.get('temp_comment')
         user_id = update.effective_user.id
+        
+        if not translation:
+            await query.answer("❌ Ошибка выбора. Попробуй снова.")
+            return
         
         conn = get_db_connection()
         cur = conn.cursor()
@@ -398,7 +413,7 @@ async def show_delete_menu(query, context, item_type, page=0):
     total_pages = (len(items) - 1) // 5 + 1
     await query.edit_message_text(
         f"{title}\n\nСтраница {page + 1} из {total_pages}",
-        reply_markup=get_delete_words_keyboard(items, page, item_type=item_type),
+        reply_markup=get_delete_items_keyboard(items, page, item_type=item_type),
         parse_mode='Markdown'
     )
 
@@ -618,9 +633,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         translations = translate_word(word_only)
         context.user_data['temp_eng'] = word_only
         context.user_data['temp_comment'] = comment
+        context.user_data['translation_variants'] = translations
         
         if translations:
-            context.user_data['translation_variants'] = translations
             comment_text = f"\n\n📝 Комментарий: _{comment}_" if comment else ""
             await update.message.reply_text(
                 f"📖 Переводы для *{word_only}*:{comment_text}\n\nВыбери подходящий вариант или введи свой:",
