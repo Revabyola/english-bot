@@ -304,6 +304,43 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     await update.message.reply_text("❌ Действие отменено.", reply_markup=get_main_keyboard())
 
+# --- Инициализация бота (ДО Flask эндпоинтов) ---
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
+
+init_db()
+
+# Создаём приложение Telegram ГЛОБАЛЬНО
+application = Application.builder().token(TOKEN).build()
+
+# Регистрируем все handlers
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("help", help_command))
+application.add_handler(CommandHandler("cancel", cancel))
+application.add_handler(CallbackQueryHandler(button_handler))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+# --- Фоновый обработчик очереди ---
+import asyncio
+from threading import Thread
+
+async def process_updates():
+    while True:
+        try:
+            update = await application.update_queue.get()
+            await application.process_update(update)
+        except Exception as e:
+            logger.error(f"Ошибка обработки: {e}")
+
+def start_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(process_updates())
+
+Thread(target=start_loop, daemon=True).start()
+logger.info("Фоновый обработчик очереди запущен")
+
 # --- Flask эндпоинты ---
 @app.route('/health')
 def health():
@@ -311,41 +348,13 @@ def health():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """Принимает обновления от Telegram."""
     update = Update.de_json(request.get_json(force=True), application.bot)
     application.update_queue.put_nowait(update)
     return Response("OK", status=200)
 
 # --- Запуск ---
-def main():
-    global application
-    TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not TOKEN: raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
-    
-    init_db()
-    
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
-    # Запуск фонового обработчика очереди (обязательно для вебхука)
-    import asyncio
-    from threading import Thread
-    async def process_updates():
-        while True:
-            try:
-                update = await application.update_queue.get()
-                await application.process_update(update)
-            except Exception as e:
-                logger.error(f"Ошибка обработки: {e}")
-    def start_loop():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(process_updates())
-    Thread(target=start_loop, daemon=True).start()
-    
+if __name__ == "__main__":
     # Установка вебхука
     app_url = os.environ.get("RENDER_EXTERNAL_URL")
     if app_url:
@@ -354,6 +363,3 @@ def main():
     
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-if __name__ == "__main__":
-    main()
