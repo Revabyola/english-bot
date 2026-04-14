@@ -4,7 +4,7 @@ import random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler, CallbackQueryHandler
+    ContextTypes, CallbackQueryHandler
 )
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -15,9 +15,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# --- Состояния ---
-(ADD_WORD_WAIT_RUS, ADD_PHRASAL_WAIT_PREP_RUS) = range(2)
 
 # --- Подключение к БД ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -151,7 +148,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text("👋 Главное меню:", reply_markup=get_main_keyboard())
         
     elif data == "end_test":
-        # Завершение теста досрочно
         correct = context.user_data.get('test_correct', 0)
         total = context.user_data.get('test_total', 0)
         context.user_data.clear()
@@ -207,7 +203,6 @@ async def ask_next_word_question(query, context):
     direction = context.user_data.get('test_direction', 'en_ru')
     
     if index >= len(words):
-        # Тест закончен
         correct = context.user_data.get('test_correct', 0)
         total = context.user_data.get('test_total', 0)
         context.user_data.clear()
@@ -221,10 +216,10 @@ async def ask_next_word_question(query, context):
     
     if direction == "en_ru":
         question = f"🇬🇧 *{word['english']}*"
-        context.user_data['correct_answer'] = word['russian'].lower()
+        context.user_data['correct_answer'] = word['russian'].lower().strip()
     else:
         question = f"🇷🇺 *{word['russian']}*"
-        context.user_data['correct_answer'] = word['english'].lower()
+        context.user_data['correct_answer'] = word['english'].lower().strip()
     
     progress = f"📌 Вопрос {index + 1} из {len(words)}"
     
@@ -239,7 +234,7 @@ async def start_phrasal_test(query, context):
     user_id = query.from_user.id
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM phrasal_verbs WHERE user_id = %s ORDER BY RANDOM()", (user_id,))
+    cur.execute("SELECT * FROM phrasal_verbs WHERE user_id = %s", (user_id,))
     verbs = cur.fetchall()
     cur.close()
     conn.close()
@@ -248,24 +243,29 @@ async def start_phrasal_test(query, context):
         await query.edit_message_text("❌ Нет фразовых глаголов. Добавь их через меню!", reply_markup=get_back_keyboard())
         return
     
-    # Для каждого глагола выбираем случайный предлог
     test_items = []
     for verb in verbs:
-        preps_list = [p.strip() for p in verb['prepositions'].split(',')]
-        chosen_prep = random.choice(preps_list)
-        
-        translations = verb['russian'].split(';')
-        correct_rus = ""
-        for t in translations:
-            if chosen_prep in t:
-                correct_rus = t.split('—')[1].strip()
-                break
-        
-        test_items.append({
-            'verb': verb['verb'],
-            'prep': chosen_prep,
-            'meaning': correct_rus
-        })
+        preps_list = [p.strip() for p in verb['prepositions'].split(',') if p.strip()]
+        if preps_list:
+            chosen_prep = random.choice(preps_list)
+            
+            translations = verb['russian'].split(';')
+            correct_rus = ""
+            for t in translations:
+                if chosen_prep in t and '—' in t:
+                    correct_rus = t.split('—')[1].strip()
+                    break
+            
+            if correct_rus:
+                test_items.append({
+                    'verb': verb['verb'],
+                    'prep': chosen_prep,
+                    'meaning': correct_rus
+                })
+    
+    if not test_items:
+        await query.edit_message_text("❌ Нет данных для теста. Проверь формат добавленных глаголов!\n\nПример: `look` → `after = присматривать`", reply_markup=get_back_keyboard())
+        return
     
     random.shuffle(test_items)
     
@@ -284,12 +284,15 @@ async def ask_next_phrasal_question(query, context):
     index = context.user_data.get('test_index', 0)
     
     if index >= len(items):
-        # Тест закончен
         correct = context.user_data.get('test_correct', 0)
         total = context.user_data.get('test_total', 0)
         context.user_data.clear()
         
-        text = f"🏁 *Тест завершён!*\n\n✅ Правильно: {correct}\n❌ Ошибок: {total - correct}\n📊 Точность: {int(correct/total*100) if total > 0 else 0}%"
+        if total > 0:
+            text = f"🏁 *Тест завершён!*\n\n✅ Правильно: {correct}\n❌ Ошибок: {total - correct}\n📊 Точность: {int(correct/total*100)}%"
+        else:
+            text = "🏁 *Тест завершён!*"
+        
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
         return
     
@@ -373,7 +376,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data['temp_verb'] = user_text.lower()
         context.user_data['awaiting'] = 'add_phrasal_data'
         await update.message.reply_text(
-            "✏️ Введи предлог(и) и перевод:\n`after = присматривать, down = презирать`",
+            "✏️ Введи предлог(и) и перевод:\n\n`after = присматривать, down = презирать`",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
@@ -386,9 +389,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         preps, trans = [], []
         for p in raw_text.split(','):
             if '=' in p:
-                prep, tran = p.split('=')
+                prep, tran = p.split('=', 1)
                 preps.append(prep.strip())
                 trans.append(f"{prep.strip()} — {tran.strip()}")
+        
+        if not preps:
+            await update.message.reply_text("❌ Неверный формат. Попробуй снова.", reply_markup=get_main_keyboard())
+            context.user_data.clear()
+            return
         
         conn = get_db_connection()
         cur = conn.cursor()
@@ -405,13 +413,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     # --- Тест по словам ---
     elif awaiting == 'word_test_answer':
-        user_answer = user_text.lower()
+        user_answer = user_text.lower().strip()
         correct = context.user_data.get('correct_answer', '')
         word = context.user_data.get('current_word', {})
         
         context.user_data['test_total'] = context.user_data.get('test_total', 0) + 1
         
-        if user_answer == correct:
+        is_correct = False
+        if ',' in correct:
+            correct_variants = [v.strip() for v in correct.split(',')]
+            is_correct = user_answer in correct_variants
+        else:
+            is_correct = user_answer == correct
+        
+        if is_correct:
             context.user_data['test_correct'] = context.user_data.get('test_correct', 0) + 1
             response = f"✅ *Верно!* ({word.get('english', '')} — {word.get('russian', '')})"
         else:
@@ -419,10 +434,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         
         await update.message.reply_text(response, parse_mode='Markdown')
         
-        # Переходим к следующему вопросу
         context.user_data['test_index'] = context.user_data.get('test_index', 0) + 1
         
-        # Создаём фейковый query для функции ask_next
         class FakeQuery:
             def __init__(self, message):
                 self.message = message
@@ -434,9 +447,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     # --- Тест по фразовым глаголам ---
     elif awaiting == 'phrasal_test_answer':
-        user_answer = user_text.lower()
+        user_answer = user_text.lower().strip()
         item = context.user_data.get('current_phrasal_item', {})
-        correct_prep = item.get('prep', '')
+        correct_prep = item.get('prep', '').lower()
         
         context.user_data['test_total'] = context.user_data.get('test_total', 0) + 1
         
@@ -448,7 +461,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         
         await update.message.reply_text(response, parse_mode='Markdown')
         
-        # Переходим к следующему вопросу
         context.user_data['test_index'] = context.user_data.get('test_index', 0) + 1
         
         class FakeQuery:
@@ -468,7 +480,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     await update.message.reply_text("❌ Действие отменено.", reply_markup=get_main_keyboard())
 
-# --- ЗАПУСК POLLING ---
+# --- ЗАПУСК ---
 def main():
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
