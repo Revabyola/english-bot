@@ -1,7 +1,6 @@
 import os
 import logging
 import random
-from flask import Flask, request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -18,12 +17,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Состояния ---
-(ADD_WORD_WAIT_RUS, ADD_PHRASAL_WAIT_PREP_RUS, WAIT_DELETE_CONFIRMATION) = range(3)
+(ADD_WORD_WAIT_RUS, ADD_PHRASAL_WAIT_PREP_RUS) = range(2)
 
-# --- Flask приложение для вебхука и health-check ---
-app = Flask(__name__)
-
-# --- Подключение к БД (Render Postgres) ---
+# --- Подключение к БД ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 def get_db_connection():
@@ -141,13 +137,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.clear()
     elif data == "help":
         await query.edit_message_text(
-            "📚 *Справка по командам:*\n\n"
-            "➕ *Добавить слово* — добавить пару англ-рус\n"
-            "📘 *Добавить фразовый глагол* — глагол с предлогами\n"
+            "📚 *Справка:*\n\n"
+            "➕ *Добавить слово* — пара англ-рус\n"
+            "📘 *Фразовый глагол* — глагол с предлогами\n"
             "📝 *Тест* — проверка знаний\n"
-            "📋 *Список слов* — показать все слова\n"
-            "🗑 *Очистить словарь* — удалить все данные\n\n"
-            "В тесте можно выбрать направление перевода.",
+            "📋 *Список* — все слова\n"
+            "🗑 *Очистить* — удалить всё",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
@@ -166,7 +161,6 @@ async def start_test(query, context, direction):
         return
     
     context.user_data['current_word'] = word
-    context.user_data['test_direction'] = direction
     context.user_data['awaiting'] = 'test_answer'
     
     if direction == "en_ru":
@@ -263,7 +257,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif awaiting == 'add_phrasal_verb':
         context.user_data['temp_verb'] = user_text.lower()
         context.user_data['awaiting'] = 'add_phrasal_data'
-        await update.message.reply_text("✏️ Введи предлог(и) и перевод в формате:\n\n`after = присматривать, down = презирать`", reply_markup=get_back_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("✏️ Введи предлог(и) и перевод:\n`after = присматривать, down = презирать`", reply_markup=get_back_keyboard(), parse_mode='Markdown')
     elif awaiting == 'add_phrasal_data':
         verb = context.user_data.get('temp_verb')
         raw_text = user_text
@@ -298,68 +292,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.clear()
         await update.message.reply_text(response, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     else:
-        await update.message.reply_text("Используй кнопки меню для навигации.", reply_markup=get_main_keyboard())
+        await update.message.reply_text("Используй кнопки меню.", reply_markup=get_main_keyboard())
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     await update.message.reply_text("❌ Действие отменено.", reply_markup=get_main_keyboard())
 
-# --- Инициализация бота (ДО Flask эндпоинтов) ---
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
-
-init_db()
-
-# Создаём приложение Telegram ГЛОБАЛЬНО
-application = Application.builder().token(TOKEN).build()
-
-# Регистрируем все handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("cancel", cancel))
-application.add_handler(CallbackQueryHandler(button_handler))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-# --- Фоновый обработчик очереди ---
-import asyncio
-from threading import Thread
-
-async def process_updates():
-    while True:
-        try:
-            update = await application.update_queue.get()
-            await application.process_update(update)
-        except Exception as e:
-            logger.error(f"Ошибка обработки: {e}")
-
-def start_loop():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(process_updates())
-
-Thread(target=start_loop, daemon=True).start()
-logger.info("Фоновый обработчик очереди запущен")
-
-# --- Flask эндпоинты ---
-@app.route('/health')
-def health():
-    return Response("OK", status=200)
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Принимает обновления от Telegram."""
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put_nowait(update)
-    return Response("OK", status=200)
-
-# --- Запуск ---
-if __name__ == "__main__":
-    # Установка вебхука
-    app_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if app_url:
-        application.bot.set_webhook(f"{app_url}/webhook")
-        logger.info(f"Webhook установлен: {app_url}/webhook")
+# --- ЗАПУСК POLLING ---
+def main():
+    TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not TOKEN:
+        raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
     
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    init_db()
+    
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    logger.info("Бот запущен в режиме POLLING")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
