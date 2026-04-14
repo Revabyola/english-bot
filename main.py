@@ -5,7 +5,7 @@ from flask import Flask, request, Response
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler, CallbackQueryHandler
+    ContextTypes, ConversationHandler
 )
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -54,7 +54,7 @@ def init_db():
     cur.close()
     conn.close()
 
-# --- Основные функции бота (без изменений) ---
+# --- Основные функции бота ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -291,7 +291,7 @@ def health():
     """Эндпоинт для cron-job, чтобы сервер не засыпал."""
     return Response("OK", status=200)
 
-@app.route(f'/{TOKEN}', methods=['POST'])
+@app.route('/webhook', methods=['POST'])
 def webhook():
     """Принимает обновления от Telegram."""
     update = Update.de_json(request.get_json(force=True), application.bot)
@@ -300,15 +300,13 @@ def webhook():
 
 # --- Запуск (локально и на Render) ---
 if __name__ == "__main__":
-    # На Render порт берется из переменной окружения PORT
     port = int(os.environ.get("PORT", 5000))
     
     # Устанавливаем вебхук при старте
     app_url = os.environ.get("RENDER_EXTERNAL_URL")
     if app_url:
-        webhook_url = f"{app_url}/{TOKEN}"
+        webhook_url = f"{app_url}/webhook"
         application.bot.set_webhook(webhook_url)
         logger.info(f"Webhook установлен: {webhook_url}")
     
-    # Запускаем Flask сервер
     app.run(host="0.0.0.0", port=port)
