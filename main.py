@@ -1,6 +1,7 @@
 import os
 import logging
 import random
+from flask import Flask, request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -19,7 +20,10 @@ logger = logging.getLogger(__name__)
 # --- Состояния ---
 (ADD_WORD_WAIT_RUS, ADD_PHRASAL_WAIT_PREP_RUS, WAIT_DELETE_CONFIRMATION) = range(3)
 
-# --- Подключение к БД ---
+# --- Flask приложение для вебхука и health-check ---
+app = Flask(__name__)
+
+# --- Подключение к БД (Render Postgres) ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 def get_db_connection():
@@ -51,7 +55,6 @@ def init_db():
 
 # --- Клавиатуры ---
 def get_main_keyboard():
-    """Главное меню с кнопками."""
     keyboard = [
         [InlineKeyboardButton("➕ Добавить слово", callback_data="add_word")],
         [InlineKeyboardButton("📘 Добавить фразовый глагол", callback_data="add_phrasal")],
@@ -63,7 +66,6 @@ def get_main_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_test_direction_keyboard():
-    """Клавиатура выбора направления теста."""
     keyboard = [
         [InlineKeyboardButton("🇬🇧 Английский → Русский", callback_data="test_en_ru")],
         [InlineKeyboardButton("🇷🇺 Русский → Английский", callback_data="test_ru_en")],
@@ -73,12 +75,10 @@ def get_test_direction_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_back_keyboard():
-    """Клавиатура с кнопкой Назад."""
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
     return InlineKeyboardMarkup(keyboard)
 
 def get_delete_confirmation_keyboard():
-    """Клавиатура подтверждения удаления."""
     keyboard = [
         [InlineKeyboardButton("✅ Да, удалить всё", callback_data="confirm_delete")],
         [InlineKeyboardButton("❌ Нет, отмена", callback_data="back_to_main")]
@@ -87,26 +87,15 @@ def get_delete_confirmation_keyboard():
 
 # --- Основные функции ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /start."""
     await update.message.reply_text(
-        "👋 Привет! Я словарный бот.\n\n"
-        "📌 *Возможности:*\n"
-        "• Добавление слов с переводом\n"
-        "• Добавление фразовых глаголов\n"
-        "• Тесты на перевод в обе стороны\n"
-        "• Тесты по предлогам\n\n"
-        "Выбери действие на клавиатуре:",
-        reply_markup=get_main_keyboard(),
-        parse_mode='Markdown'
+        "👋 Привет! Я словарный бот.\n\nВыбери действие на клавиатуре:",
+        reply_markup=get_main_keyboard()
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /help."""
     await start(update, context)
 
-# --- Обработчики кнопок ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик нажатий на inline-кнопки."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -114,39 +103,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if data == "add_word":
         await query.edit_message_text("✏️ Введи слово на английском:")
         context.user_data['awaiting'] = 'add_word_eng'
-        
     elif data == "add_phrasal":
         await query.edit_message_text("📘 Введи глагол (например, 'look'):")
         context.user_data['awaiting'] = 'add_phrasal_verb'
-        
     elif data == "test_menu":
         await query.edit_message_text(
             "📝 *Выбери тип теста:*",
             reply_markup=get_test_direction_keyboard(),
             parse_mode='Markdown'
         )
-        
     elif data == "test_en_ru":
         await start_test(query, context, "en_ru")
-        
     elif data == "test_ru_en":
         await start_test(query, context, "ru_en")
-        
     elif data == "test_phrasal":
         await start_phrasal_test(query, context)
-        
     elif data == "list":
         await show_word_list(query, context)
-        
     elif data == "delete_all":
         await query.edit_message_text(
-            "⚠️ *Внимание!*\n\n"
-            "Ты уверен, что хочешь удалить ВСЕ слова и фразовые глаголы?\n"
-            "Это действие нельзя отменить!",
+            "⚠️ *Внимание!*\n\nТы уверен, что хочешь удалить ВСЕ слова и фразовые глаголы?\nЭто действие нельзя отменить!",
             reply_markup=get_delete_confirmation_keyboard(),
             parse_mode='Markdown'
         )
-        
     elif data == "confirm_delete":
         user_id = update.effective_user.id
         conn = get_db_connection()
@@ -156,18 +135,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         conn.commit()
         cur.close()
         conn.close()
-        await query.edit_message_text(
-            "✅ Словарь полностью очищен!",
-            reply_markup=get_back_keyboard()
-        )
-        
+        await query.edit_message_text("✅ Словарь полностью очищен!", reply_markup=get_back_keyboard())
     elif data == "back_to_main":
-        await query.edit_message_text(
-            "👋 Главное меню. Выбери действие:",
-            reply_markup=get_main_keyboard()
-        )
+        await query.edit_message_text("👋 Главное меню:", reply_markup=get_main_keyboard())
         context.user_data.clear()
-        
     elif data == "help":
         await query.edit_message_text(
             "📚 *Справка по командам:*\n\n"
@@ -182,7 +153,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 async def start_test(query, context, direction):
-    """Запуск теста на перевод слов."""
     user_id = query.from_user.id
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -192,10 +162,7 @@ async def start_test(query, context, direction):
     conn.close()
     
     if not word:
-        await query.edit_message_text(
-            "❌ Словарь пуст. Сначала добавь слова!",
-            reply_markup=get_back_keyboard()
-        )
+        await query.edit_message_text("❌ Словарь пуст. Сначала добавь слова!", reply_markup=get_back_keyboard())
         return
     
     context.user_data['current_word'] = word
@@ -216,7 +183,6 @@ async def start_test(query, context, direction):
     )
 
 async def start_phrasal_test(query, context):
-    """Запуск теста на фразовые глаголы."""
     user_id = query.from_user.id
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -226,10 +192,7 @@ async def start_phrasal_test(query, context):
     conn.close()
     
     if not verb:
-        await query.edit_message_text(
-            "❌ Нет фразовых глаголов. Добавь их через меню!",
-            reply_markup=get_back_keyboard()
-        )
+        await query.edit_message_text("❌ Нет фразовых глаголов. Добавь их через меню!", reply_markup=get_back_keyboard())
         return
     
     context.user_data['current_phrasal'] = verb
@@ -246,204 +209,151 @@ async def start_phrasal_test(query, context):
             break
     
     await query.edit_message_text(
-        f"📖 *{verb['verb']}* ______\n\n"
-        f"Значение: _{correct_rus}_\n\n"
-        f"Введи правильный предлог:",
+        f"📖 *{verb['verb']}* ______\n\nЗначение: _{correct_rus}_\n\nВведи правильный предлог:",
         reply_markup=get_back_keyboard(),
         parse_mode='Markdown'
     )
 
 async def show_word_list(query, context):
-    """Показывает список всех слов пользователя."""
     user_id = query.from_user.id
     conn = get_db_connection()
     cur = conn.cursor()
-    
-    # Обычные слова
     cur.execute("SELECT english, russian FROM words WHERE user_id = %s ORDER BY id", (user_id,))
     words = cur.fetchall()
-    
-    # Фразовые глаголы
     cur.execute("SELECT verb, prepositions, russian FROM phrasal_verbs WHERE user_id = %s ORDER BY id", (user_id,))
     phrasals = cur.fetchall()
     cur.close()
     conn.close()
     
     text = "📋 *Твой словарь:*\n\n"
-    
     if words:
         text += "📝 *Слова:*\n"
-        for w in words[:15]:
-            text += f"• {w[0]} — {w[1]}\n"
-        if len(words) > 15:
-            text += f"_...и ещё {len(words)-15}_\n"
+        for w in words[:15]: text += f"• {w[0]} — {w[1]}\n"
     else:
         text += "📝 *Слова:* пока нет\n"
-    
     text += "\n"
-    
     if phrasals:
         text += "📘 *Фразовые глаголы:*\n"
-        for p in phrasals[:10]:
-            text += f"• {p[0]} ({p[1]}) — {p[2]}\n"
-        if len(phrasals) > 10:
-            text += f"_...и ещё {len(phrasals)-10}_\n"
+        for p in phrasals[:10]: text += f"• {p[0]} ({p[1]}) — {p[2]}\n"
     else:
         text += "📘 *Фразовые глаголы:* пока нет\n"
     
-    await query.edit_message_text(
-        text,
-        reply_markup=get_back_keyboard(),
-        parse_mode='Markdown'
-    )
+    await query.edit_message_text(text, reply_markup=get_back_keyboard(), parse_mode='Markdown')
 
-# --- Обработчик текстовых сообщений ---
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик всех текстовых сообщений."""
     user_text = update.message.text.strip()
     awaiting = context.user_data.get('awaiting')
     
     if awaiting == 'add_word_eng':
         context.user_data['temp_eng'] = user_text
         context.user_data['awaiting'] = 'add_word_rus'
-        await update.message.reply_text(
-            "🇷🇺 Теперь введи перевод на русском:",
-            reply_markup=get_back_keyboard()
-        )
-        
+        await update.message.reply_text("🇷🇺 Теперь введи перевод на русском:", reply_markup=get_back_keyboard())
     elif awaiting == 'add_word_rus':
         eng = context.user_data.get('temp_eng')
         rus = user_text
         user_id = update.effective_user.id
-        
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO words (english, russian, user_id) VALUES (%s, %s, %s)",
-            (eng, rus, user_id)
-        )
+        cur.execute("INSERT INTO words (english, russian, user_id) VALUES (%s, %s, %s)", (eng, rus, user_id))
         conn.commit()
         cur.close()
         conn.close()
-        
         context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Пара *{eng} — {rus}* сохранена!",
-            reply_markup=get_main_keyboard(),
-            parse_mode='Markdown'
-        )
-        
+        await update.message.reply_text(f"✅ Пара *{eng} — {rus}* сохранена!", reply_markup=get_main_keyboard(), parse_mode='Markdown')
     elif awaiting == 'add_phrasal_verb':
         context.user_data['temp_verb'] = user_text.lower()
         context.user_data['awaiting'] = 'add_phrasal_data'
-        await update.message.reply_text(
-            "✏️ Введи предлог(и) и перевод в формате:\n\n"
-            "<code>after = присматривать, down = презирать</code>\n\n"
-            "_Можно несколько через запятую_",
-            reply_markup=get_back_keyboard(),
-            parse_mode='HTML'
-        )
-        
+        await update.message.reply_text("✏️ Введи предлог(и) и перевод в формате:\n\n`after = присматривать, down = презирать`", reply_markup=get_back_keyboard(), parse_mode='Markdown')
     elif awaiting == 'add_phrasal_data':
         verb = context.user_data.get('temp_verb')
         raw_text = user_text
         user_id = update.effective_user.id
-        
-        preps = []
-        trans = []
+        preps, trans = [], []
         for p in raw_text.split(','):
             if '=' in p:
                 prep, tran = p.split('=')
                 preps.append(prep.strip())
                 trans.append(f"{prep.strip()} — {tran.strip()}")
-        
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO phrasal_verbs (verb, prepositions, russian, user_id) VALUES (%s, %s, %s, %s)",
-            (verb, ", ".join(preps), "; ".join(trans), user_id)
-        )
+        cur.execute("INSERT INTO phrasal_verbs (verb, prepositions, russian, user_id) VALUES (%s, %s, %s, %s)", (verb, ", ".join(preps), "; ".join(trans), user_id))
         conn.commit()
         cur.close()
         conn.close()
-        
         context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Глагол *{verb}* сохранён!",
-            reply_markup=get_main_keyboard(),
-            parse_mode='Markdown'
-        )
-        
+        await update.message.reply_text(f"✅ Глагол *{verb}* сохранён!", reply_markup=get_main_keyboard(), parse_mode='Markdown')
     elif awaiting == 'test_answer':
         user_answer = user_text.lower()
         correct = context.user_data.get('correct_answer')
         word_data = context.user_data.get('current_word')
-        
-        if user_answer == correct:
-            response = "✅ *Верно!*"
-        else:
-            response = f"❌ *Неверно!*\nПравильно: *{word_data['english']} — {word_data['russian']}*"
-        
+        if user_answer == correct: response = "✅ *Верно!*"
+        else: response = f"❌ *Неверно!*\nПравильно: *{word_data['english']} — {word_data['russian']}*"
         context.user_data.clear()
-        await update.message.reply_text(
-            response,
-            reply_markup=get_main_keyboard(),
-            parse_mode='Markdown'
-        )
-        
+        await update.message.reply_text(response, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     elif awaiting == 'phrasal_answer':
         user_answer = user_text.lower()
         correct_prep = context.user_data.get('chosen_prep')
-        
-        if user_answer == correct_prep:
-            response = "✅ *Точно!*"
-        else:
-            response = f"❌ *Не угадал!*\nНужен предлог: *{correct_prep}*"
-        
+        if user_answer == correct_prep: response = "✅ *Точно!*"
+        else: response = f"❌ *Не угадал!*\nНужен предлог: *{correct_prep}*"
         context.user_data.clear()
-        await update.message.reply_text(
-            response,
-            reply_markup=get_main_keyboard(),
-            parse_mode='Markdown'
-        )
-        
+        await update.message.reply_text(response, reply_markup=get_main_keyboard(), parse_mode='Markdown')
     else:
-        await update.message.reply_text(
-            "Используй кнопки меню для навигации.\n"
-            "Или нажми /start чтобы открыть главное меню."
-        )
+        await update.message.reply_text("Используй кнопки меню для навигации.", reply_markup=get_main_keyboard())
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отмена текущего действия."""
     context.user_data.clear()
-    await update.message.reply_text(
-        "❌ Действие отменено.",
-        reply_markup=get_main_keyboard()
-    )
+    await update.message.reply_text("❌ Действие отменено.", reply_markup=get_main_keyboard())
+
+# --- Flask эндпоинты ---
+@app.route('/health')
+def health():
+    return Response("OK", status=200)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put_nowait(update)
+    return Response("OK", status=200)
 
 # --- Запуск ---
 def main():
+    global application
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not TOKEN:
-        raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
+    if not TOKEN: raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
     
     init_db()
     
-    app = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    # Команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("cancel", cancel))
+    # Запуск фонового обработчика очереди (обязательно для вебхука)
+    import asyncio
+    from threading import Thread
+    async def process_updates():
+        while True:
+            try:
+                update = await application.update_queue.get()
+                await application.process_update(update)
+            except Exception as e:
+                logger.error(f"Ошибка обработки: {e}")
+    def start_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(process_updates())
+    Thread(target=start_loop, daemon=True).start()
     
-    # Кнопки
-    app.add_handler(CallbackQueryHandler(button_handler))
+    # Установка вебхука
+    app_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if app_url:
+        application.bot.set_webhook(f"{app_url}/webhook")
+        logger.info(f"Webhook установлен: {app_url}/webhook")
     
-    # Текстовые сообщения
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
-    logger.info("Бот запущен в режиме POLLING")
-    app.run_polling()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
