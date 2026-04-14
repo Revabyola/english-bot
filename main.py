@@ -2,6 +2,7 @@ import os
 import logging
 import random
 import threading
+import re
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -34,6 +35,7 @@ def init_db():
             id SERIAL PRIMARY KEY,
             english TEXT NOT NULL,
             russian TEXT NOT NULL,
+            comment TEXT,
             user_id BIGINT NOT NULL
         );
     """)
@@ -50,6 +52,14 @@ def init_db():
     cur.close()
     conn.close()
 
+# --- Парсинг комментария ---
+def parse_word_with_comment(text):
+    """Извлекает слово и комментарий из строки вида 'word (comment)'."""
+    match = re.match(r'^(.+?)\s*\((.+)\)$', text.strip())
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return text.strip(), None
+
 # --- Клавиатуры ---
 def get_main_keyboard():
     keyboard = [
@@ -57,7 +67,8 @@ def get_main_keyboard():
         [InlineKeyboardButton("📘 Добавить фразовый глагол", callback_data="add_phrasal")],
         [InlineKeyboardButton("📝 Тест", callback_data="test_menu")],
         [InlineKeyboardButton("📋 Список слов", callback_data="list")],
-        [InlineKeyboardButton("❌ Удалить слова", callback_data="delete_words")],  # НОВАЯ КНОПКА
+        [InlineKeyboardButton("❌ Удалить слова", callback_data="delete_words")],
+        [InlineKeyboardButton("❌ Удалить фразовые глаголы", callback_data="delete_phrasal")],
         [InlineKeyboardButton("🗑 Очистить словарь", callback_data="delete_all")],
         [InlineKeyboardButton("❓ Помощь", callback_data="help")]
     ]
@@ -95,29 +106,32 @@ def get_translation_variants_keyboard(variants, english_word):
     keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_delete_words_keyboard(words, page=0, per_page=5):
-    """Клавиатура для удаления слов с пагинацией."""
+def get_delete_words_keyboard(items, page=0, per_page=5, item_type="word"):
+    """Универсальная клавиатура для удаления слов или фразовых глаголов."""
     keyboard = []
     
     start = page * per_page
     end = start + per_page
-    current_words = words[start:end]
+    current_items = items[start:end]
     
-    # Кнопки для удаления слов
-    for word in current_words:
+    for item in current_items:
+        if item_type == "word":
+            display = f"🗑 {item['english']} — {item['russian']}"
+        else:
+            display = f"🗑 {item['verb']} ({item['prepositions']}) — {item['russian']}"
+        
         keyboard.append([
             InlineKeyboardButton(
-                f"🗑 {word['english']} — {word['russian']}", 
-                callback_data=f"delete_word_{word['id']}"
+                display, 
+                callback_data=f"delete_{item_type}_{item['id']}"
             )
         ])
     
-    # Кнопки навигации
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"delete_page_{page-1}"))
-    if end < len(words):
-        nav_buttons.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"delete_page_{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"delete_{item_type}_page_{page-1}"))
+    if end < len(items):
+        nav_buttons.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"delete_{item_type}_page_{page+1}"))
     
     if nav_buttons:
         keyboard.append(nav_buttons)
@@ -147,11 +161,9 @@ def start_http_server():
     logger.info(f"HTTP сервер запущен на порту {port}")
     server.serve_forever()
 
-# --- ИИ-переводчик (Google Translate + синонимы) ---
+# --- ИИ-переводчик ---
 def translate_word(word):
-    """Переводит слово через Google Translate и добавляет синонимы."""
     translations = []
-    
     translator = GoogleTranslator(source='en', target='ru')
     
     try:
@@ -199,9 +211,12 @@ def translate_word(word):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я словарный бот с ИИ-переводчиком.\n\n"
-        "При добавлении слова я предлагаю до 6 вариантов перевода!\n\n"
+        "✨ *Новые возможности:*\n"
+        "• Комментарии в скобках: `behave (вести себя)`\n"
+        "• Удаление отдельных слов и фразовых глаголов\n\n"
         "Выбери действие на клавиатуре:",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(),
+        parse_mode='Markdown'
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -216,14 +231,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     data = query.data
     
+    # --- Добавление слов ---
     if data == "add_word":
-        await query.edit_message_text("✏️ Введи слово на английском:")
+        await query.edit_message_text(
+            "✏️ Введи слово на английском.\n\n"
+            "_Можно добавить комментарий в скобках:_\n"
+            "`behave (вести себя хорошо)`",
+            parse_mode='Markdown'
+        )
         context.user_data['awaiting'] = 'add_word_eng'
         
     elif data == "add_phrasal":
         await query.edit_message_text("📘 Введи глагол (например, 'look'):")
         context.user_data['awaiting'] = 'add_phrasal_verb'
         
+    # --- Тесты ---
     elif data == "test_menu":
         await query.edit_message_text(
             "📝 *Выбери тип теста:*",
@@ -240,21 +262,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "test_phrasal":
         await start_phrasal_test(query, context)
         
+    # --- Список слов ---
     elif data == "list":
         await show_word_list(query, context)
     
-    # НОВАЯ ФУНКЦИЯ: Удаление слов
+    # --- Удаление слов ---
     elif data == "delete_words":
-        await show_delete_words_menu(query, context, page=0)
-    
-    elif data.startswith("delete_page_"):
-        page = int(data.replace("delete_page_", ""))
-        await show_delete_words_menu(query, context, page=page)
-    
-    elif data.startswith("delete_word_"):
-        word_id = int(data.replace("delete_word_", ""))
-        await delete_single_word(query, context, word_id)
+        await show_delete_menu(query, context, "word", page=0)
         
+    elif data.startswith("delete_word_page_"):
+        page = int(data.replace("delete_word_page_", ""))
+        await show_delete_menu(query, context, "word", page=page)
+        
+    elif data.startswith("delete_word_"):
+        item_id = int(data.replace("delete_word_", ""))
+        await delete_single_item(query, context, "word", item_id)
+    
+    # --- Удаление фразовых глаголов ---
+    elif data == "delete_phrasal":
+        await show_delete_menu(query, context, "phrasal", page=0)
+        
+    elif data.startswith("delete_phrasal_page_"):
+        page = int(data.replace("delete_phrasal_page_", ""))
+        await show_delete_menu(query, context, "phrasal", page=page)
+        
+    elif data.startswith("delete_phrasal_"):
+        item_id = int(data.replace("delete_phrasal_", ""))
+        await delete_single_item(query, context, "phrasal", item_id)
+        
+    # --- Полная очистка ---
     elif data == "delete_all":
         await query.edit_message_text(
             "⚠️ *Внимание!*\n\nТы уверен, что хочешь удалить ВСЕ слова и фразовые глаголы?\nЭто действие нельзя отменить!",
@@ -273,6 +309,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         conn.close()
         await query.edit_message_text("✅ Словарь полностью очищен!", reply_markup=get_back_keyboard())
         
+    # --- Навигация ---
     elif data == "back_to_main":
         context.user_data.clear()
         await query.edit_message_text("👋 Главное меню:", reply_markup=get_main_keyboard())
@@ -289,6 +326,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
         
+    # --- Выбор перевода ---
     elif data == "custom_translation":
         await query.edit_message_text(
             "✏️ Введи свой перевод:",
@@ -299,18 +337,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data.startswith("choose_"):
         translation = data.replace("choose_", "")
         english = context.user_data.get('temp_eng', '')
+        comment = context.user_data.get('temp_comment')
         user_id = update.effective_user.id
         
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("INSERT INTO words (english, russian, user_id) VALUES (%s, %s, %s)", (english, translation, user_id))
+        cur.execute(
+            "INSERT INTO words (english, russian, comment, user_id) VALUES (%s, %s, %s, %s)",
+            (english, translation, comment, user_id)
+        )
         conn.commit()
         cur.close()
         conn.close()
         
         context.user_data.clear()
+        
+        comment_text = f"\n📝 _({comment})_" if comment else ""
         await query.edit_message_text(
-            f"✅ Пара *{english} — {translation}* сохранена!",
+            f"✅ Пара *{english} — {translation}* сохранена!{comment_text}",
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown'
         )
@@ -318,54 +362,66 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "help":
         await query.edit_message_text(
             "📚 *Справка:*\n\n"
-            "➕ *Добавить слово* — ИИ предложит до 6 вариантов перевода\n"
+            "➕ *Добавить слово* — можно с комментарием в скобках\n"
             "📘 *Фразовый глагол* — глагол с предлогами\n"
             "📝 *Тест* — непрерывная проверка знаний\n"
-            "📋 *Список* — все слова\n"
-            "❌ *Удалить слова* — удалить отдельные слова\n"
+            "📋 *Список* — все слова и глаголы\n"
+            "❌ *Удалить слова/глаголы* — выборочное удаление\n"
             "🗑 *Очистить* — удалить всё",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
 
-async def show_delete_words_menu(query, context, page=0):
-    """Показывает меню удаления слов с пагинацией."""
+async def show_delete_menu(query, context, item_type, page=0):
+    """Показывает меню удаления (слов или фразовых глаголов)."""
     user_id = query.from_user.id
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT id, english, russian FROM words WHERE user_id = %s ORDER BY id", (user_id,))
-    words = cur.fetchall()
+    
+    if item_type == "word":
+        cur.execute("SELECT id, english, russian FROM words WHERE user_id = %s ORDER BY id", (user_id,))
+        title = "🗑 *Выбери слово для удаления:*"
+        empty_message = "📭 Словарь пуст. Нечего удалять."
+    else:
+        cur.execute("SELECT id, verb, prepositions, russian FROM phrasal_verbs WHERE user_id = %s ORDER BY id", (user_id,))
+        title = "🗑 *Выбери фразовый глагол для удаления:*"
+        empty_message = "📭 Нет фразовых глаголов. Нечего удалять."
+    
+    items = cur.fetchall()
     cur.close()
     conn.close()
     
-    if not words:
-        await query.edit_message_text(
-            "📭 Словарь пуст. Нечего удалять.",
-            reply_markup=get_back_keyboard()
-        )
+    if not items:
+        await query.edit_message_text(empty_message, reply_markup=get_back_keyboard())
         return
     
+    total_pages = (len(items) - 1) // 5 + 1
     await query.edit_message_text(
-        f"🗑 *Выбери слово для удаления:*\n\nСтраница {page + 1} из {(len(words) - 1) // 5 + 1}",
-        reply_markup=get_delete_words_keyboard(words, page),
+        f"{title}\n\nСтраница {page + 1} из {total_pages}",
+        reply_markup=get_delete_words_keyboard(items, page, item_type=item_type),
         parse_mode='Markdown'
     )
 
-async def delete_single_word(query, context, word_id):
-    """Удаляет одно слово и обновляет меню."""
+async def delete_single_item(query, context, item_type, item_id):
+    """Удаляет одно слово или фразовый глагол."""
     user_id = query.from_user.id
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM words WHERE id = %s AND user_id = %s", (word_id, user_id))
+    
+    if item_type == "word":
+        cur.execute("DELETE FROM words WHERE id = %s AND user_id = %s", (item_id, user_id))
+        success_message = "✅ Слово удалено!"
+    else:
+        cur.execute("DELETE FROM phrasal_verbs WHERE id = %s AND user_id = %s", (item_id, user_id))
+        success_message = "✅ Фразовый глагол удалён!"
+    
     conn.commit()
     cur.close()
     conn.close()
     
-    await query.answer("✅ Слово удалено!")
-    
-    # Возвращаемся на первую страницу меню удаления
-    await show_delete_words_menu(query, context, page=0)
+    await query.answer(success_message)
+    await show_delete_menu(query, context, item_type, page=0)
 
 async def start_word_test(query, context, direction):
     user_id = query.from_user.id
@@ -385,7 +441,6 @@ async def start_word_test(query, context, direction):
     context.user_data['test_direction'] = direction
     context.user_data['test_correct'] = 0
     context.user_data['test_total'] = 0
-    context.user_data['in_word_test'] = True
     context.user_data['awaiting'] = 'word_test_answer'
     
     await ask_next_word_question(query, context)
@@ -410,9 +465,11 @@ async def ask_next_word_question(query, context):
     if direction == "en_ru":
         question = f"🇬🇧 *{word['english']}*"
         context.user_data['correct_answer'] = word['russian'].lower().strip()
+        context.user_data['test_type'] = 'en_ru'
     else:
         question = f"🇷🇺 *{word['russian']}*"
         context.user_data['correct_answer'] = word['english'].lower().strip()
+        context.user_data['test_type'] = 'ru_en'
     
     progress = f"📌 Вопрос {index + 1} из {len(words)}"
     
@@ -467,11 +524,7 @@ async def start_phrasal_test(query, context):
         })
     
     if not test_items:
-        await query.edit_message_text(
-            "❌ Нет данных для теста.",
-            reply_markup=get_back_keyboard(),
-            parse_mode='Markdown'
-        )
+        await query.edit_message_text("❌ Нет данных для теста.", reply_markup=get_back_keyboard())
         return
     
     random.shuffle(test_items)
@@ -480,7 +533,6 @@ async def start_phrasal_test(query, context):
     context.user_data['test_index'] = 0
     context.user_data['test_correct'] = 0
     context.user_data['test_total'] = 0
-    context.user_data['in_phrasal_test'] = True
     context.user_data['awaiting'] = 'phrasal_test_answer'
     
     await ask_next_phrasal_question(query, context)
@@ -518,7 +570,7 @@ async def show_word_list(query, context):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute("SELECT english, russian FROM words WHERE user_id = %s ORDER BY id", (user_id,))
+    cur.execute("SELECT english, russian, comment FROM words WHERE user_id = %s ORDER BY id", (user_id,))
     words = cur.fetchall()
     
     cur.execute("SELECT verb, prepositions, russian FROM phrasal_verbs WHERE user_id = %s ORDER BY id", (user_id,))
@@ -531,7 +583,10 @@ async def show_word_list(query, context):
     if words:
         text += "📝 *Слова:*\n"
         for w in words[:15]:
-            text += f"• {w[0]} — {w[1]}\n"
+            if w[2]:
+                text += f"• {w[0]} — {w[1]} _({w[2]})_\n"
+            else:
+                text += f"• {w[0]} — {w[1]}\n"
         if len(words) > 15:
             text += f"_...и ещё {len(words)-15}_\n"
     else:
@@ -554,17 +609,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_text = update.message.text.strip()
     awaiting = context.user_data.get('awaiting')
     
+    # --- Добавление слова ---
     if awaiting == 'add_word_eng':
+        word_only, comment = parse_word_with_comment(user_text)
+        
         await update.message.reply_text("🔄 Перевожу через ИИ...")
         
-        translations = translate_word(user_text)
-        context.user_data['temp_eng'] = user_text
+        translations = translate_word(word_only)
+        context.user_data['temp_eng'] = word_only
+        context.user_data['temp_comment'] = comment
         
         if translations:
             context.user_data['translation_variants'] = translations
+            comment_text = f"\n\n📝 Комментарий: _{comment}_" if comment else ""
             await update.message.reply_text(
-                f"📖 Переводы для *{user_text}*:\n\nВыбери подходящий вариант или введи свой:",
-                reply_markup=get_translation_variants_keyboard(translations, user_text),
+                f"📖 Переводы для *{word_only}*:{comment_text}\n\nВыбери подходящий вариант или введи свой:",
+                reply_markup=get_translation_variants_keyboard(translations, word_only),
                 parse_mode='Markdown'
             )
             context.user_data['awaiting'] = None
@@ -575,25 +635,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             context.user_data['awaiting'] = 'add_word_rus_manual'
     
+    # --- Ручной ввод перевода ---
     elif awaiting == 'add_word_rus_manual':
         english = context.user_data.get('temp_eng', '')
         russian = user_text
+        comment = context.user_data.get('temp_comment')
         user_id = update.effective_user.id
         
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("INSERT INTO words (english, russian, user_id) VALUES (%s, %s, %s)", (english, russian, user_id))
+        cur.execute(
+            "INSERT INTO words (english, russian, comment, user_id) VALUES (%s, %s, %s, %s)",
+            (english, russian, comment, user_id)
+        )
         conn.commit()
         cur.close()
         conn.close()
         
         context.user_data.clear()
+        
+        comment_text = f"\n📝 _({comment})_" if comment else ""
         await update.message.reply_text(
-            f"✅ Пара *{english} — {russian}* сохранена!",
+            f"✅ Пара *{english} — {russian}* сохранена!{comment_text}",
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown'
         )
     
+    # --- Добавление фразового глагола ---
     elif awaiting == 'add_phrasal_verb':
         context.user_data['temp_verb'] = user_text.lower()
         context.user_data['awaiting'] = 'add_phrasal_data'
@@ -633,25 +701,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.clear()
         await update.message.reply_text(f"✅ Глагол *{verb}* сохранён!", reply_markup=get_main_keyboard(), parse_mode='Markdown')
     
+    # --- Тест по словам ---
     elif awaiting == 'word_test_answer':
         user_answer = user_text.lower().strip()
-        correct = context.user_data.get('correct_answer', '')
+        correct = context.user_data.get('correct_answer', '').lower().strip()
         word = context.user_data.get('current_word', {})
+        test_type = context.user_data.get('test_type', 'en_ru')
         
         context.user_data['test_total'] = context.user_data.get('test_total', 0) + 1
         
         is_correct = False
         if ',' in correct:
-            correct_variants = [v.strip() for v in correct.split(',')]
+            correct_variants = [v.strip().lower() for v in correct.split(',')]
             is_correct = user_answer in correct_variants
         else:
             is_correct = user_answer == correct
         
         if is_correct:
             context.user_data['test_correct'] = context.user_data.get('test_correct', 0) + 1
-            response = f"✅ *Верно!* ({word.get('english', '')} — {word.get('russian', '')})"
+            if test_type == 'en_ru':
+                response = f"✅ *Верно!* ({word.get('english', '')} — {word.get('russian', '')})"
+            else:
+                response = f"✅ *Верно!* ({word.get('russian', '')} — {word.get('english', '')})"
         else:
-            response = f"❌ *Неверно!*\nПравильно: *{word.get('english', '')} — {word.get('russian', '')}*"
+            if test_type == 'en_ru':
+                response = f"❌ *Неверно!*\nПравильно: *{word.get('english', '')} — {word.get('russian', '')}*"
+            else:
+                response = f"❌ *Неверно!*\nПравильно: *{word.get('russian', '')} — {word.get('english', '')}*"
         
         await update.message.reply_text(response, parse_mode='Markdown')
         context.user_data['test_index'] = context.user_data.get('test_index', 0) + 1
@@ -662,6 +738,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         
         await ask_next_word_question(FakeQuery(update.message), context)
     
+    # --- Тест по фразовым глаголам ---
     elif awaiting == 'phrasal_test_answer':
         user_answer = user_text.lower().strip()
         item = context.user_data.get('current_phrasal_item', {})
@@ -684,6 +761,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         
         await ask_next_phrasal_question(FakeQuery(update.message), context)
     
+    # --- Нет активного действия ---
     else:
         await update.message.reply_text("Используй кнопки меню для навигации.", reply_markup=get_main_keyboard())
 
@@ -710,7 +788,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("Бот с ИИ-переводчиком и удалением слов запущен!")
+    logger.info("Бот с ИИ-переводчиком, комментариями и удалением запущен!")
     app.run_polling()
 
 if __name__ == "__main__":
