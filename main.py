@@ -1,6 +1,8 @@
 import os
 import logging
 import random
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -79,11 +81,31 @@ def get_delete_confirmation_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_test_active_keyboard():
-    """Клавиатура во время активного теста."""
     keyboard = [[InlineKeyboardButton("❌ Завершить тест", callback_data="end_test")]]
     return InlineKeyboardMarkup(keyboard)
 
-# --- Основные функции ---
+# --- HTTP сервер для Render ---
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        pass  # Отключаем логи HTTP-запросов
+
+def start_http_server():
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f"HTTP сервер запущен на порту {port}")
+    server.serve_forever()
+
+# --- Основные функции бота ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я словарный бот.\n\nВыбери действие на клавиатуре:",
@@ -251,13 +273,11 @@ async def start_phrasal_test(query, context):
             
         chosen_prep = random.choice(preps_list)
         
-        # Безопасный разбор переводов
         translations = verb['russian'].split(';')
         correct_rus = ""
         for t in translations:
             t = t.strip()
             if chosen_prep in t:
-                # Ищем любой разделитель: — или - или :
                 for sep in ['—', '-', ':']:
                     if sep in t:
                         parts = t.split(sep, 1)
@@ -267,7 +287,6 @@ async def start_phrasal_test(query, context):
                 if correct_rus:
                     break
         
-        # Если перевод не найден — используем заглушку
         if not correct_rus:
             correct_rus = f"({chosen_prep})"
         
@@ -279,9 +298,7 @@ async def start_phrasal_test(query, context):
     
     if not test_items:
         await query.edit_message_text(
-            "❌ Нет данных для теста. Проверь формат добавленных глаголов!\n\n"
-            "Пример правильного формата:\n"
-            "`after = присматривать, down = презирать`",
+            "❌ Нет данных для теста. Проверь формат добавленных глаголов!\n\nПример: `after = присматривать`",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
@@ -508,6 +525,10 @@ def main():
     
     init_db()
     
+    # Запускаем HTTP-сервер в отдельном потоке
+    http_thread = threading.Thread(target=start_http_server, daemon=True)
+    http_thread.start()
+    
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
@@ -516,7 +537,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("Бот запущен в режиме POLLING")
+    logger.info("Бот запущен в режиме POLLING + HTTP сервер")
     app.run_polling()
 
 if __name__ == "__main__":
