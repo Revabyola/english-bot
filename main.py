@@ -11,7 +11,6 @@ from telegram.ext import (
 )
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from googletrans import Translator
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -87,8 +86,9 @@ def get_test_active_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_translation_variants_keyboard(variants, english_word):
+    """Клавиатура с вариантами перевода."""
     keyboard = []
-    for variant in variants[:4]:
+    for variant in variants[:4]:  # Максимум 4 варианта
         keyboard.append([InlineKeyboardButton(variant, callback_data=f"choose_{variant}")])
     keyboard.append([InlineKeyboardButton("✏️ Ввести свой вариант", callback_data="custom_translation")])
     keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")])
@@ -115,41 +115,40 @@ def start_http_server():
     logger.info(f"HTTP сервер запущен на порту {port}")
     server.serve_forever()
 
-# --- ИИ-переводчик (MyMemory + Google Translate) ---
+# --- ИИ-переводчик (MyMemory API) ---
 def translate_word(word):
-    translations = []
-    
-    # Способ 1: MyMemory API
+    """Переводит слово через MyMemory API (бесплатно)."""
     try:
         url = "https://api.mymemory.translated.net/get"
-        params = {"q": word, "langpair": "en|ru"}
+        params = {
+            "q": word,
+            "langpair": "en|ru"
+        }
         response = requests.get(url, params=params, timeout=5)
         data = response.json()
         
         if data.get("responseStatus") == 200:
+            translations = []
+            
+            # Основной перевод
             main_translation = data.get("responseData", {}).get("translatedText", "").lower()
             if main_translation:
                 translations.append(main_translation)
             
+            # Альтернативные переводы из matches
             for match in data.get("matches", [])[:3]:
                 translation = match.get("translation", "").lower()
                 if translation and translation not in translations:
                     translations.append(translation)
+            
+            # Убираем дубликаты и возвращаем до 4 вариантов
+            unique_translations = list(dict.fromkeys(translations))
+            return unique_translations[:4]
+        
+        return []
     except Exception as e:
-        logger.warning(f"MyMemory API ошибка: {e}")
-    
-    # Способ 2: Google Translate (резервный)
-    if not translations:
-        try:
-            translator = Translator()
-            result = translator.translate(word, src='en', dest='ru')
-            if result and result.text:
-                translations.append(result.text.lower())
-        except Exception as e:
-            logger.warning(f"Google Translate ошибка: {e}")
-    
-    unique_translations = list(dict.fromkeys(translations))
-    return unique_translations[:4]
+        logger.error(f"Ошибка перевода: {e}")
+        return []
 
 # --- Основные функции бота ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -241,6 +240,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data['awaiting'] = 'add_word_rus_manual'
         
     elif data.startswith("choose_"):
+        # Пользователь выбрал вариант перевода
         translation = data.replace("choose_", "")
         english = context.user_data.get('temp_eng', '')
         user_id = update.effective_user.id
@@ -272,6 +272,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 async def start_word_test(query, context, direction):
+    """Запуск непрерывного теста по словам."""
     user_id = query.from_user.id
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -295,6 +296,7 @@ async def start_word_test(query, context, direction):
     await ask_next_word_question(query, context)
 
 async def ask_next_word_question(query, context):
+    """Задаёт следующий вопрос в тесте по словам."""
     words = context.user_data.get('test_words', [])
     index = context.user_data.get('test_index', 0)
     direction = context.user_data.get('test_direction', 'en_ru')
@@ -327,6 +329,7 @@ async def ask_next_word_question(query, context):
     )
 
 async def start_phrasal_test(query, context):
+    """Запуск непрерывного теста по фразовым глаголам."""
     user_id = query.from_user.id
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -372,7 +375,7 @@ async def start_phrasal_test(query, context):
     
     if not test_items:
         await query.edit_message_text(
-            "❌ Нет данных для теста.",
+            "❌ Нет данных для теста. Проверь формат добавленных глаголов!",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
@@ -390,6 +393,7 @@ async def start_phrasal_test(query, context):
     await ask_next_phrasal_question(query, context)
 
 async def ask_next_phrasal_question(query, context):
+    """Задаёт следующий вопрос в тесте по фразовым глаголам."""
     items = context.user_data.get('test_phrasal_items', [])
     index = context.user_data.get('test_index', 0)
     
@@ -418,6 +422,7 @@ async def ask_next_phrasal_question(query, context):
     )
 
 async def show_word_list(query, context):
+    """Показывает список всех слов пользователя."""
     user_id = query.from_user.id
     conn = get_db_connection()
     cur = conn.cursor()
@@ -455,11 +460,13 @@ async def show_word_list(query, context):
     await query.edit_message_text(text, reply_markup=get_back_keyboard(), parse_mode='Markdown')
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик текстовых сообщений."""
     user_text = update.message.text.strip()
     awaiting = context.user_data.get('awaiting')
     
     # --- Добавление слова: ввод английского ---
     if awaiting == 'add_word_eng':
+        # Переводим слово через ИИ
         await update.message.reply_text("🔄 Перевожу через ИИ...")
         
         translations = translate_word(user_text)
@@ -472,8 +479,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=get_translation_variants_keyboard(translations, user_text),
                 parse_mode='Markdown'
             )
-            context.user_data['awaiting'] = None
+            context.user_data['awaiting'] = None  # Ждём выбора через кнопки
         else:
+            # Если перевод не найден — просим ввести вручную
             await update.message.reply_text(
                 "❌ Не удалось найти перевод.\n\n🇷🇺 Введи перевод на русском вручную:",
                 reply_markup=get_back_keyboard()
@@ -617,6 +625,7 @@ def main():
     
     init_db()
     
+    # Запускаем HTTP-сервер в отдельном потоке
     http_thread = threading.Thread(target=start_http_server, daemon=True)
     http_thread.start()
     
