@@ -88,7 +88,7 @@ def get_test_active_keyboard():
 
 def get_translation_variants_keyboard(variants, english_word):
     keyboard = []
-    for variant in variants[:4]:
+    for variant in variants[:6]:
         keyboard.append([InlineKeyboardButton(variant, callback_data=f"choose_{variant}")])
     keyboard.append([InlineKeyboardButton("✏️ Ввести свой вариант", callback_data="custom_translation")])
     keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")])
@@ -115,35 +115,63 @@ def start_http_server():
     logger.info(f"HTTP сервер запущен на порту {port}")
     server.serve_forever()
 
-# --- ИИ-переводчик (Google Translate) ---
+# --- ИИ-переводчик (Google Translate + синонимы) ---
 def translate_word(word):
-    """Переводит слово через Google Translate."""
+    """Переводит слово через Google Translate и добавляет синонимы."""
     translations = []
     
+    translator = GoogleTranslator(source='en', target='ru')
+    
+    # 1. Основной перевод
     try:
-        translator = GoogleTranslator(source='en', target='ru')
         result = translator.translate(word)
-        
         if result:
             translations.append(result.lower())
-            
-            try:
-                result2 = translator.translate(f"to {word}")
-                if result2 and result2.lower() not in translations:
-                    translations.append(result2.lower())
-            except:
-                pass
     except Exception as e:
         logger.warning(f"Google Translate ошибка: {e}")
     
+    # 2. Синонимы через Datamuse API
+    try:
+        url = f"https://api.datamuse.com/words?rel_syn={word}&max=5"
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            synonyms = response.json()
+            for syn in synonyms[:5]:
+                syn_word = syn.get('word', '')
+                if syn_word and syn_word != word:
+                    try:
+                        syn_translation = translator.translate(syn_word)
+                        if syn_translation and syn_translation.lower() not in translations:
+                            translations.append(syn_translation.lower())
+                    except:
+                        pass
+    except Exception as e:
+        logger.warning(f"Datamuse API ошибка: {e}")
+    
+    # 3. Контекстные переводы
+    try:
+        result2 = translator.translate(f"to {word}")
+        if result2 and result2.lower() not in translations:
+            translations.append(result2.lower())
+    except:
+        pass
+    
+    try:
+        result3 = translator.translate(f"a {word}")
+        if result3 and result3.lower() not in translations:
+            translations.append(result3.lower())
+    except:
+        pass
+    
+    # Убираем дубликаты и возвращаем до 6 вариантов
     unique_translations = list(dict.fromkeys(translations))
-    return unique_translations[:4]
+    return unique_translations[:6]
 
 # --- Основные функции бота ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я словарный бот с ИИ-переводчиком.\n\n"
-        "При добавлении слова я автоматически предлагаю варианты перевода!\n\n"
+        "При добавлении слова я предлагаю до 6 вариантов перевода!\n\n"
         "Выбери действие на клавиатуре:",
         reply_markup=get_main_keyboard()
     )
@@ -250,7 +278,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "help":
         await query.edit_message_text(
             "📚 *Справка:*\n\n"
-            "➕ *Добавить слово* — ИИ предложит варианты перевода\n"
+            "➕ *Добавить слово* — ИИ предложит до 6 вариантов перевода\n"
             "📘 *Фразовый глагол* — глагол с предлогами\n"
             "📝 *Тест* — непрерывная проверка знаний\n"
             "📋 *Список* — все слова\n"
@@ -602,7 +630,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("Бот с Google Translate запущен!")
+    logger.info("Бот с ИИ-переводчиком (Google Translate + синонимы) запущен!")
     app.run_polling()
 
 if __name__ == "__main__":
