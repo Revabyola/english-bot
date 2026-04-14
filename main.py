@@ -1,9 +1,6 @@
 import os
 import logging
 import random
-import asyncio
-from threading import Thread
-from flask import Flask, request, Response
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -19,20 +16,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Состояния для ConversationHandler ---
+# --- Состояния ---
 (ADD_WORD_WAIT_RUS, ADD_PHRASAL_WAIT_PREP_RUS) = range(2)
 
-# --- Flask приложение для вебхука и health-check ---
-app = Flask(__name__)
-
-# --- Подключение к БД (Render Postgres) ---
+# --- Подключение к БД ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    """Создаем таблицы, если их нет."""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -56,17 +49,15 @@ def init_db():
     cur.close()
     conn.close()
 
-# --- Основные функции бота ---
-
+# --- Функции бота (без изменений) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я словарный бот.\n"
-        "Команды:\n"
         "/add - Добавить слово\n"
         "/add_phrasal - Добавить фразовый глагол\n"
         "/test - Тест (перевод)\n"
         "/test_phrasal - Тест по предлогам\n"
-        "/list - Список твоих слов"
+        "/list - Список слов"
     )
 
 async def add_word_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -105,9 +96,8 @@ async def add_phrasal_prep_rus(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['temp_verb'] = verb
     
     await update.message.reply_text(
-        "✏️ Введи предлог(и) и перевод в формате:\n"
-        "<code>after = присматривать, down = презирать</code>\n\n"
-        "(Можно несколько через запятую)",
+        "✏️ Введи предлог(и) и перевод:\n"
+        "<code>after = присматривать, down = презирать</code>",
         parse_mode='HTML'
     )
     return 1
@@ -119,27 +109,23 @@ async def add_phrasal_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     preps = []
     trans = []
-    pairs = raw_text.split(',')
-    for p in pairs:
+    for p in raw_text.split(','):
         if '=' in p:
             prep, tran = p.split('=')
             preps.append(prep.strip())
             trans.append(f"{prep.strip()} — {tran.strip()}")
     
-    prepositions_str = ", ".join(preps)
-    translation_str = "; ".join(trans)
-    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO phrasal_verbs (verb, prepositions, russian, user_id) VALUES (%s, %s, %s, %s)",
-        (verb, prepositions_str, translation_str, user_id)
+        (verb, ", ".join(preps), "; ".join(trans), user_id)
     )
     conn.commit()
     cur.close()
     conn.close()
     
-    await update.message.reply_text(f"✅ Глагол '{verb}' с предлогами сохранен!")
+    await update.message.reply_text(f"✅ Глагол '{verb}' сохранен!")
     return ConversationHandler.END
 
 async def test_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,12 +138,11 @@ async def test_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     conn.close()
     
     if not word:
-        await update.message.reply_text("Словарь пуст. Добавь слова командой /add")
+        await update.message.reply_text("Словарь пуст. Добавь слова через /add")
         return
     
     context.user_data['current_word'] = word
     direction = random.randint(0, 1)
-    context.user_data['direction'] = direction
     
     if direction == 0:
         question = f"🇬🇧 Как переводится: *{word['english']}*?"
@@ -178,26 +163,22 @@ async def test_phrasal_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     conn.close()
     
     if not verb:
-        await update.message.reply_text("Список фразовых глаголов пуст. Добавь командой /add_phrasal")
+        await update.message.reply_text("Список пуст. Добавь через /add_phrasal")
         return
     
     context.user_data['current_phrasal'] = verb
-    
     preps_list = [p.strip() for p in verb['prepositions'].split(',')]
     chosen_prep = random.choice(preps_list)
     context.user_data['chosen_prep'] = chosen_prep
     
     translations = verb['russian'].split(';')
-    correct_rus = None
+    correct_rus = ""
     for t in translations:
         if chosen_prep in t:
             correct_rus = t.split('—')[1].strip()
             break
     
-    context.user_data['correct_phrasal_answer'] = correct_rus.lower() if correct_rus else ""
-    
-    question = f"📖 {verb['verb']} ______ (значение: {correct_rus})"
-    await update.message.reply_text(f"{question}\n\nВведи предлог:")
+    await update.message.reply_text(f"📖 {verb['verb']} ______ (значение: {correct_rus})\n\nВведи предлог:")
 
 async def handle_test_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_answer = update.message.text.strip().lower()
@@ -209,23 +190,20 @@ async def handle_test_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if user_answer == correct:
             await update.message.reply_text("✅ Верно!")
         else:
-            hint = f"❌ Неверно. Правильно: {word_data['english']} — {word_data['russian']}"
-            await update.message.reply_text(hint)
+            await update.message.reply_text(f"❌ Правильно: {word_data['english']} — {word_data['russian']}")
         
         del context.user_data['current_word']
         del context.user_data['correct_answer']
-        del context.user_data['direction']
         
     elif 'current_phrasal' in context.user_data:
         correct_prep = context.user_data['chosen_prep']
         if user_answer == correct_prep:
             await update.message.reply_text("✅ Точно!")
         else:
-            await update.message.reply_text(f"❌ Не угадал. Нужен предлог: *{correct_prep}*", parse_mode='Markdown')
+            await update.message.reply_text(f"❌ Нужен предлог: *{correct_prep}*", parse_mode='Markdown')
         
         del context.user_data['current_phrasal']
         del context.user_data['chosen_prep']
-        del context.user_data['correct_phrasal_answer']
 
 async def list_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -247,92 +225,38 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Действие отменено.")
     return ConversationHandler.END
 
-# --- Инициализация бота ---
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
-
-# Создаем приложение Telegram
-application = Application.builder().token(TOKEN).build()
-
-# Conversation для добавления слов
-conv_handler_add = ConversationHandler(
-    entry_points=[CommandHandler('add', add_word_start)],
-    states={
-        0: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_word_rus)],
-        1: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_word_save)],
-    },
-    fallbacks=[CommandHandler('cancel', cancel)],
-)
-
-# Conversation для фразовых глаголов
-conv_handler_phrasal = ConversationHandler(
-    entry_points=[CommandHandler('add_phrasal', add_phrasal_start)],
-    states={
-        0: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phrasal_prep_rus)],
-        1: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phrasal_save)],
-    },
-    fallbacks=[CommandHandler('cancel', cancel)],
-)
-
-application.add_handler(conv_handler_add)
-application.add_handler(conv_handler_phrasal)
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("test", test_start))
-application.add_handler(CommandHandler("test_phrasal", test_phrasal_start))
-application.add_handler(CommandHandler("list", list_words))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_test_answer))
-
-# --- Фоновый обработчик очереди обновлений ---
-async def process_updates():
-    """Забирает обновления из очереди и передает их боту."""
-    logger.info("Обработчик очереди запущен, жду обновления...")
-    while True:
-        try:
-            update = await application.update_queue.get()
-            logger.info(f"Получено обновление: {update.update_id}")
-            await application.process_update(update)
-        except Exception as e:
-            logger.error(f"Ошибка обработки обновления: {e}")
-
-def start_background_loop():
-    """Запускает асинхронный цикл в отдельном потоке."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(process_updates())
-
-# Запускаем фоновый поток для обработки очереди
-Thread(target=start_background_loop, daemon=True).start()
-logger.info("Фоновый обработчик очереди запущен в отдельном потоке")
-
-# Инициализация БД
-init_db()
-
-# --- Flask эндпоинты ---
-
-@app.route('/health')
-def health():
-    """Эндпоинт для cron-job, чтобы сервер не засыпал."""
-    return Response("OK", status=200)
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Принимает обновления от Telegram."""
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put_nowait(update)
-    logger.info(f"Обновление {update.update_id} помещено в очередь")
-    return Response("OK", status=200)
-
 # --- Запуск ---
+def main():
+    TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not TOKEN:
+        raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
+    
+    init_db()
+    
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('add', add_word_start)],
+        states={0: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_word_rus)],
+                1: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_word_save)]},
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
+    
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('add_phrasal', add_phrasal_start)],
+        states={0: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phrasal_prep_rus)],
+                1: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phrasal_save)]},
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("test", test_start))
+    app.add_handler(CommandHandler("test_phrasal", test_phrasal_start))
+    app.add_handler(CommandHandler("list", list_words))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_test_answer))
+    
+    logger.info("Бот запущен в режиме POLLING")
+    app.run_polling()
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    
-    # Устанавливаем вебхук при старте
-    app_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if app_url:
-        webhook_url = f"{app_url}/webhook"
-        application.bot.set_webhook(webhook_url)
-        logger.info(f"Webhook установлен: {webhook_url}")
-    
-    logger.info(f"Запуск Flask сервера на порту {port}")
-    app.run(host="0.0.0.0", port=port)
+    main()
