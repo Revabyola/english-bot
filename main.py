@@ -2,6 +2,7 @@ import os
 import logging
 import random
 import threading
+import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -84,6 +85,15 @@ def get_test_active_keyboard():
     keyboard = [[InlineKeyboardButton("❌ Завершить тест", callback_data="end_test")]]
     return InlineKeyboardMarkup(keyboard)
 
+def get_translation_variants_keyboard(variants, english_word):
+    """Клавиатура с вариантами перевода."""
+    keyboard = []
+    for variant in variants[:4]:  # Максимум 4 варианта
+        keyboard.append([InlineKeyboardButton(variant, callback_data=f"choose_{variant}")])
+    keyboard.append([InlineKeyboardButton("✏️ Ввести свой вариант", callback_data="custom_translation")])
+    keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(keyboard)
+
 # --- HTTP сервер для Render ---
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -97,7 +107,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
     
     def log_message(self, format, *args):
-        pass  # Отключаем логи HTTP-запросов
+        pass
 
 def start_http_server():
     port = int(os.environ.get('PORT', 10000))
@@ -105,10 +115,47 @@ def start_http_server():
     logger.info(f"HTTP сервер запущен на порту {port}")
     server.serve_forever()
 
+# --- ИИ-переводчик (MyMemory API) ---
+def translate_word(word):
+    """Переводит слово через MyMemory API (бесплатно)."""
+    try:
+        url = "https://api.mymemory.translated.net/get"
+        params = {
+            "q": word,
+            "langpair": "en|ru"
+        }
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+        
+        if data.get("responseStatus") == 200:
+            translations = []
+            
+            # Основной перевод
+            main_translation = data.get("responseData", {}).get("translatedText", "").lower()
+            if main_translation:
+                translations.append(main_translation)
+            
+            # Альтернативные переводы из matches
+            for match in data.get("matches", [])[:3]:
+                translation = match.get("translation", "").lower()
+                if translation and translation not in translations:
+                    translations.append(translation)
+            
+            # Убираем дубликаты и возвращаем до 4 вариантов
+            unique_translations = list(dict.fromkeys(translations))
+            return unique_translations[:4]
+        
+        return []
+    except Exception as e:
+        logger.error(f"Ошибка перевода: {e}")
+        return []
+
 # --- Основные функции бота ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 Привет! Я словарный бот.\n\nВыбери действие на клавиатуре:",
+        "👋 Привет! Я словарный бот с ИИ-переводчиком.\n\n"
+        "При добавлении слова я автоматически предлагаю варианты перевода!\n\n"
+        "Выбери действие на клавиатуре:",
         reply_markup=get_main_keyboard()
     )
 
@@ -117,7 +164,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Не удалось ответить на callback: {e}")
+    
     data = query.data
     
     if data == "add_word":
@@ -181,15 +232,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         await query.edit_message_text(text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
         
+    elif data == "custom_translation":
+        await query.edit_message_text(
+            "✏️ Введи свой перевод:",
+            reply_markup=get_back_keyboard()
+        )
+        context.user_data['awaiting'] = 'add_word_rus_manual'
+        
+    elif data.startswith("choose_"):
+        # Пользователь выбрал вариант перевода
+        translation = data.replace("choose_", "")
+        english = context.user_data.get('temp_eng', '')
+        user_id = update.effective_user.id
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO words (english, russian, user_id) VALUES (%s, %s, %s)", (english, translation, user_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        context.user_data.clear()
+        await query.edit_message_text(
+            f"✅ Пара *{english} — {translation}* сохранена!",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
+        
     elif data == "help":
         await query.edit_message_text(
             "📚 *Справка:*\n\n"
-            "➕ *Добавить слово* — пара англ-рус\n"
+            "➕ *Добавить слово* — ИИ предложит варианты перевода\n"
             "📘 *Фразовый глагол* — глагол с предлогами\n"
             "📝 *Тест* — непрерывная проверка знаний\n"
             "📋 *Список* — все слова\n"
-            "🗑 *Очистить* — удалить всё\n\n"
-            "В тесте слова идут друг за другом. Нажми «Завершить тест» для выхода.",
+            "🗑 *Очистить* — удалить всё",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
@@ -298,7 +375,7 @@ async def start_phrasal_test(query, context):
     
     if not test_items:
         await query.edit_message_text(
-            "❌ Нет данных для теста. Проверь формат добавленных глаголов!\n\nПример: `after = присматривать`",
+            "❌ Нет данных для теста. Проверь формат добавленных глаголов!",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
@@ -387,26 +464,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_text = update.message.text.strip()
     awaiting = context.user_data.get('awaiting')
     
-    # --- Добавление обычного слова ---
+    # --- Добавление слова: ввод английского ---
     if awaiting == 'add_word_eng':
-        context.user_data['temp_eng'] = user_text
-        context.user_data['awaiting'] = 'add_word_rus'
-        await update.message.reply_text("🇷🇺 Теперь введи перевод на русском:", reply_markup=get_back_keyboard())
+        # Переводим слово через ИИ
+        await update.message.reply_text("🔄 Перевожу через ИИ...")
         
-    elif awaiting == 'add_word_rus':
-        eng = context.user_data.get('temp_eng')
-        rus = user_text
+        translations = translate_word(user_text)
+        context.user_data['temp_eng'] = user_text
+        
+        if translations:
+            context.user_data['translation_variants'] = translations
+            await update.message.reply_text(
+                f"📖 Переводы для *{user_text}*:\n\nВыбери подходящий вариант или введи свой:",
+                reply_markup=get_translation_variants_keyboard(translations, user_text),
+                parse_mode='Markdown'
+            )
+            context.user_data['awaiting'] = None  # Ждём выбора через кнопки
+        else:
+            # Если перевод не найден — просим ввести вручную
+            await update.message.reply_text(
+                "❌ Не удалось найти перевод.\n\n🇷🇺 Введи перевод на русском вручную:",
+                reply_markup=get_back_keyboard()
+            )
+            context.user_data['awaiting'] = 'add_word_rus_manual'
+    
+    # --- Ручной ввод перевода ---
+    elif awaiting == 'add_word_rus_manual':
+        english = context.user_data.get('temp_eng', '')
+        russian = user_text
         user_id = update.effective_user.id
         
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("INSERT INTO words (english, russian, user_id) VALUES (%s, %s, %s)", (eng, rus, user_id))
+        cur.execute("INSERT INTO words (english, russian, user_id) VALUES (%s, %s, %s)", (english, russian, user_id))
         conn.commit()
         cur.close()
         conn.close()
         
         context.user_data.clear()
-        await update.message.reply_text(f"✅ Пара *{eng} — {rus}* сохранена!", reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text(
+            f"✅ Пара *{english} — {russian}* сохранена!",
+            reply_markup=get_main_keyboard(),
+            parse_mode='Markdown'
+        )
     
     # --- Добавление фразового глагола ---
     elif awaiting == 'add_phrasal_verb':
@@ -537,7 +637,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("Бот запущен в режиме POLLING + HTTP сервер")
+    logger.info("Бот с ИИ-переводчиком запущен!")
     app.run_polling()
 
 if __name__ == "__main__":
