@@ -1,6 +1,8 @@
 import os
 import logging
 import random
+import asyncio
+from threading import Thread
 from flask import Flask, request, Response
 from telegram import Update
 from telegram.ext import (
@@ -245,7 +247,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Действие отменено.")
     return ConversationHandler.END
 
-# --- Инициализация бота и вебхука ---
+# --- Инициализация бота ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise ValueError("Не найден TELEGRAM_BOT_TOKEN")
@@ -281,6 +283,28 @@ application.add_handler(CommandHandler("test_phrasal", test_phrasal_start))
 application.add_handler(CommandHandler("list", list_words))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_test_answer))
 
+# --- Фоновый обработчик очереди обновлений ---
+async def process_updates():
+    """Забирает обновления из очереди и передает их боту."""
+    logger.info("Обработчик очереди запущен, жду обновления...")
+    while True:
+        try:
+            update = await application.update_queue.get()
+            logger.info(f"Получено обновление: {update.update_id}")
+            await application.process_update(update)
+        except Exception as e:
+            logger.error(f"Ошибка обработки обновления: {e}")
+
+def start_background_loop():
+    """Запускает асинхронный цикл в отдельном потоке."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(process_updates())
+
+# Запускаем фоновый поток для обработки очереди
+Thread(target=start_background_loop, daemon=True).start()
+logger.info("Фоновый обработчик очереди запущен в отдельном потоке")
+
 # Инициализация БД
 init_db()
 
@@ -295,11 +319,11 @@ def health():
 def webhook():
     """Принимает обновления от Telegram."""
     update = Update.de_json(request.get_json(force=True), application.bot)
-    # Используем синхронный метод для очереди
     application.update_queue.put_nowait(update)
+    logger.info(f"Обновление {update.update_id} помещено в очередь")
     return Response("OK", status=200)
 
-# --- Запуск (локально и на Render) ---
+# --- Запуск ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     
@@ -310,4 +334,5 @@ if __name__ == "__main__":
         application.bot.set_webhook(webhook_url)
         logger.info(f"Webhook установлен: {webhook_url}")
     
+    logger.info(f"Запуск Flask сервера на порту {port}")
     app.run(host="0.0.0.0", port=port)
