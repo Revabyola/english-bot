@@ -292,10 +292,10 @@ def health():
     return Response("OK", status=200)
 
 @app.route('/webhook', methods=['POST'])
-def webhook():
+async def webhook():
     """Принимает обновления от Telegram."""
     update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put(update)
+    await application.update_queue.put(update)
     return Response("OK", status=200)
 
 # --- Запуск (локально и на Render) ---
