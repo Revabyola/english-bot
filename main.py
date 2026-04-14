@@ -57,6 +57,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📘 Добавить фразовый глагол", callback_data="add_phrasal")],
         [InlineKeyboardButton("📝 Тест", callback_data="test_menu")],
         [InlineKeyboardButton("📋 Список слов", callback_data="list")],
+        [InlineKeyboardButton("❌ Удалить слова", callback_data="delete_words")],  # НОВАЯ КНОПКА
         [InlineKeyboardButton("🗑 Очистить словарь", callback_data="delete_all")],
         [InlineKeyboardButton("❓ Помощь", callback_data="help")]
     ]
@@ -94,6 +95,37 @@ def get_translation_variants_keyboard(variants, english_word):
     keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")])
     return InlineKeyboardMarkup(keyboard)
 
+def get_delete_words_keyboard(words, page=0, per_page=5):
+    """Клавиатура для удаления слов с пагинацией."""
+    keyboard = []
+    
+    start = page * per_page
+    end = start + per_page
+    current_words = words[start:end]
+    
+    # Кнопки для удаления слов
+    for word in current_words:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🗑 {word['english']} — {word['russian']}", 
+                callback_data=f"delete_word_{word['id']}"
+            )
+        ])
+    
+    # Кнопки навигации
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"delete_page_{page-1}"))
+    if end < len(words):
+        nav_buttons.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"delete_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
 # --- HTTP сервер для Render ---
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -122,7 +154,6 @@ def translate_word(word):
     
     translator = GoogleTranslator(source='en', target='ru')
     
-    # 1. Основной перевод
     try:
         result = translator.translate(word)
         if result:
@@ -130,7 +161,6 @@ def translate_word(word):
     except Exception as e:
         logger.warning(f"Google Translate ошибка: {e}")
     
-    # 2. Синонимы через Datamuse API
     try:
         url = f"https://api.datamuse.com/words?rel_syn={word}&max=5"
         response = requests.get(url, timeout=3)
@@ -148,7 +178,6 @@ def translate_word(word):
     except Exception as e:
         logger.warning(f"Datamuse API ошибка: {e}")
     
-    # 3. Контекстные переводы
     try:
         result2 = translator.translate(f"to {word}")
         if result2 and result2.lower() not in translations:
@@ -163,7 +192,6 @@ def translate_word(word):
     except:
         pass
     
-    # Убираем дубликаты и возвращаем до 6 вариантов
     unique_translations = list(dict.fromkeys(translations))
     return unique_translations[:6]
 
@@ -214,6 +242,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
     elif data == "list":
         await show_word_list(query, context)
+    
+    # НОВАЯ ФУНКЦИЯ: Удаление слов
+    elif data == "delete_words":
+        await show_delete_words_menu(query, context, page=0)
+    
+    elif data.startswith("delete_page_"):
+        page = int(data.replace("delete_page_", ""))
+        await show_delete_words_menu(query, context, page=page)
+    
+    elif data.startswith("delete_word_"):
+        word_id = int(data.replace("delete_word_", ""))
+        await delete_single_word(query, context, word_id)
         
     elif data == "delete_all":
         await query.edit_message_text(
@@ -282,10 +322,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "📘 *Фразовый глагол* — глагол с предлогами\n"
             "📝 *Тест* — непрерывная проверка знаний\n"
             "📋 *Список* — все слова\n"
+            "❌ *Удалить слова* — удалить отдельные слова\n"
             "🗑 *Очистить* — удалить всё",
             reply_markup=get_back_keyboard(),
             parse_mode='Markdown'
         )
+
+async def show_delete_words_menu(query, context, page=0):
+    """Показывает меню удаления слов с пагинацией."""
+    user_id = query.from_user.id
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT id, english, russian FROM words WHERE user_id = %s ORDER BY id", (user_id,))
+    words = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    if not words:
+        await query.edit_message_text(
+            "📭 Словарь пуст. Нечего удалять.",
+            reply_markup=get_back_keyboard()
+        )
+        return
+    
+    await query.edit_message_text(
+        f"🗑 *Выбери слово для удаления:*\n\nСтраница {page + 1} из {(len(words) - 1) // 5 + 1}",
+        reply_markup=get_delete_words_keyboard(words, page),
+        parse_mode='Markdown'
+    )
+
+async def delete_single_word(query, context, word_id):
+    """Удаляет одно слово и обновляет меню."""
+    user_id = query.from_user.id
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM words WHERE id = %s AND user_id = %s", (word_id, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    await query.answer("✅ Слово удалено!")
+    
+    # Возвращаемся на первую страницу меню удаления
+    await show_delete_words_menu(query, context, page=0)
 
 async def start_word_test(query, context, direction):
     user_id = query.from_user.id
@@ -630,7 +710,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("Бот с ИИ-переводчиком (Google Translate + синонимы) запущен!")
+    logger.info("Бот с ИИ-переводчиком и удалением слов запущен!")
     app.run_polling()
 
 if __name__ == "__main__":
