@@ -5,10 +5,11 @@ import threading
 import re
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler, ConversationHandler
+    ContextTypes, CallbackQueryHandler
 )
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -21,8 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Состояния ---
-AWAIT_COMMENT = 1
+# --- Flask приложение для API и health-check ---
+app = Flask(__name__)
 
 # --- Подключение к БД ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -145,7 +146,7 @@ def get_delete_items_keyboard(items, page=0, per_page=5, item_type="word"):
     keyboard.append([InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main")])
     return InlineKeyboardMarkup(keyboard)
 
-# --- HTTP сервер для Render ---
+# --- HTTP сервер для Render (встроен в Flask, оставляем для совместимости) ---
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/health':
@@ -199,7 +200,97 @@ def translate_word(word):
         pass
     return list(dict.fromkeys(translations))[:6]
 
-# --- Основные функции ---
+# --- API для Mini App ---
+@app.route('/api/translate', methods=['GET'])
+def api_translate():
+    word = request.args.get('word', '')
+    if not word:
+        return jsonify({'error': 'No word provided'}), 400
+    translations = translate_word(word)
+    return jsonify({'translations': translations})
+
+@app.route('/api/save_word', methods=['POST'])
+def api_save_word():
+    data = request.get_json()
+    english = data.get('english', '')
+    russian = data.get('russian', '')
+    user_id = data.get('user_id', 0)
+    
+    if not english or not russian or not user_id:
+        return jsonify({'success': False, 'error': 'Missing fields'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO words (english, russian, user_id) VALUES (%s, %s, %s)",
+        (english, russian, user_id)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+@app.route('/api/get_words', methods=['GET'])
+def api_get_words():
+    user_id = request.args.get('user_id', 0)
+    if not user_id:
+        return jsonify({'words': []})
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT english, russian, comment FROM words WHERE user_id = %s ORDER BY id DESC LIMIT 50", (user_id,))
+    words = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    return jsonify({'words': words})
+
+@app.route('/api/start_test', methods=['GET'])
+def api_start_test():
+    user_id = request.args.get('user_id', 0)
+    test_type = request.args.get('type', 'en_ru')
+    
+    if not user_id:
+        return jsonify({'words': []})
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM words WHERE user_id = %s ORDER BY RANDOM() LIMIT 20", (user_id,))
+    words = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    test_items = []
+    for w in words:
+        if test_type == 'en_ru':
+            question = w['english']
+            correct = w['russian']
+        elif test_type == 'ru_en':
+            question = w['russian']
+            correct = w['english']
+        else:  # mixed
+            if random.random() > 0.5:
+                question = w['english']
+                correct = w['russian']
+            else:
+                question = w['russian']
+                correct = w['english']
+        
+        test_items.append({
+            'type': 'word',
+            'question': question,
+            'correct': correct
+        })
+    
+    return jsonify({'words': test_items})
+
+# --- Health-check для Render ---
+@app.route('/health')
+def health():
+    return "OK", 200
+
+# --- Основные функции бота ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я словарный бот с ИИ-переводчиком.\n\n"
@@ -779,17 +870,23 @@ def main():
     
     init_db()
     
+    # Запускаем HTTP-сервер в отдельном потоке (для Render)
     threading.Thread(target=start_http_server, daemon=True).start()
     
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Запускаем Telegram-бота
+    app_telegram = Application.builder().token(TOKEN).build()
+    app_telegram.add_handler(CommandHandler("start", start))
+    app_telegram.add_handler(CommandHandler("help", help_command))
+    app_telegram.add_handler(CommandHandler("cancel", cancel))
+    app_telegram.add_handler(CallbackQueryHandler(button_handler))
+    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("Бот с Mini App кнопкой запущен!")
-    app.run_polling()
+    logger.info("Бот с Mini App и API запущен!")
+    
+    # Запускаем Flask и бота
+    port = int(os.environ.get('PORT', 10000))
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
+    app_telegram.run_polling()
 
 if __name__ == "__main__":
     main()
