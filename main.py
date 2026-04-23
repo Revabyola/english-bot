@@ -26,24 +26,42 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    
+    # Таблица папок/тем
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS folders (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            user_id BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(name, user_id)
+        );
+    """)
+    
+    # Таблица слов с привязкой к папке
     cur.execute("""
         CREATE TABLE IF NOT EXISTS words (
             id SERIAL PRIMARY KEY,
             english TEXT NOT NULL,
             russian TEXT NOT NULL,
             comment TEXT,
+            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
             user_id BIGINT NOT NULL
         );
     """)
+    
+    # Таблица фразовых глаголов
     cur.execute("""
         CREATE TABLE IF NOT EXISTS phrasal_verbs (
             id SERIAL PRIMARY KEY,
             verb TEXT NOT NULL,
             prepositions TEXT NOT NULL,
             russian TEXT NOT NULL,
+            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
             user_id BIGINT NOT NULL
         );
     """)
+    
     conn.commit()
     cur.close()
     conn.close()
@@ -59,7 +77,60 @@ def translate_word(word):
         pass
     return translations[:6] if translations else []
 
-# --- API ---
+# --- API ПАПКИ ---
+@app.route('/api/folders', methods=['GET'])
+def get_folders():
+    user_id = request.args.get('user_id', 0)
+    if not user_id:
+        return jsonify({'folders': []})
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT id, name FROM folders WHERE user_id = %s ORDER BY name", (user_id,))
+    folders = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify({'folders': folders})
+
+@app.route('/api/folders', methods=['POST'])
+def create_folder():
+    data = request.get_json()
+    name = data.get('name', '').strip()
+    user_id = data.get('user_id', 0)
+    
+    if not name or not user_id:
+        return jsonify({'success': False, 'error': 'Missing fields'}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO folders (name, user_id) VALUES (%s, %s) ON CONFLICT (name, user_id) DO NOTHING RETURNING id",
+            (name, user_id)
+        )
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'success': True, 'id': result[0] if result else None})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/folders/<int:folder_id>', methods=['DELETE'])
+def delete_folder(folder_id):
+    user_id = request.args.get('user_id', 0)
+    if not user_id:
+        return jsonify({'success': False}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM folders WHERE id = %s AND user_id = %s", (folder_id, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True})
+
+# --- API ПЕРЕВОД ---
 @app.route('/api/translate', methods=['GET'])
 def api_translate():
     word = request.args.get('word', '')
@@ -67,12 +138,66 @@ def api_translate():
         return jsonify({'error': 'No word'}), 400
     return jsonify({'translations': translate_word(word)})
 
-@app.route('/api/save_word', methods=['POST'])
-def api_save_word():
+# --- API СЛОВА ---
+@app.route('/api/words', methods=['GET'])
+def get_words():
+    user_id = request.args.get('user_id', 0)
+    folder_id = request.args.get('folder_id', '')
+    
+    if not user_id:
+        return jsonify({'words': [], 'phrasal_verbs': []})
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    if folder_id and folder_id != 'null' and folder_id != 'undefined':
+        cur.execute("""
+            SELECT w.id, w.english, w.russian, w.comment, w.folder_id, f.name as folder_name
+            FROM words w
+            LEFT JOIN folders f ON w.folder_id = f.id
+            WHERE w.user_id = %s AND w.folder_id = %s
+            ORDER BY w.id DESC
+        """, (user_id, folder_id))
+        words = cur.fetchall()
+        
+        cur.execute("""
+            SELECT p.id, p.verb, p.prepositions, p.russian, p.folder_id, f.name as folder_name
+            FROM phrasal_verbs p
+            LEFT JOIN folders f ON p.folder_id = f.id
+            WHERE p.user_id = %s AND p.folder_id = %s
+            ORDER BY p.id DESC
+        """, (user_id, folder_id))
+        phrasal = cur.fetchall()
+    else:
+        cur.execute("""
+            SELECT w.id, w.english, w.russian, w.comment, w.folder_id, f.name as folder_name
+            FROM words w
+            LEFT JOIN folders f ON w.folder_id = f.id
+            WHERE w.user_id = %s
+            ORDER BY w.id DESC
+        """, (user_id,))
+        words = cur.fetchall()
+        
+        cur.execute("""
+            SELECT p.id, p.verb, p.prepositions, p.russian, p.folder_id, f.name as folder_name
+            FROM phrasal_verbs p
+            LEFT JOIN folders f ON p.folder_id = f.id
+            WHERE p.user_id = %s
+            ORDER BY p.id DESC
+        """, (user_id,))
+        phrasal = cur.fetchall()
+    
+    cur.close()
+    conn.close()
+    return jsonify({'words': words, 'phrasal_verbs': phrasal})
+
+@app.route('/api/words', methods=['POST'])
+def save_word():
     data = request.get_json()
     english = data.get('english', '')
     russian = data.get('russian', '')
     comment = data.get('comment', '')
+    folder_id = data.get('folder_id')
     user_id = data.get('user_id', 0)
     
     if not english or not russian or not user_id:
@@ -81,62 +206,19 @@ def api_save_word():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO words (english, russian, comment, user_id) VALUES (%s, %s, %s, %s)",
-        (english, russian, comment, user_id)
+        "INSERT INTO words (english, russian, comment, folder_id, user_id) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        (english, russian, comment, folder_id, user_id)
     )
+    word_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
     conn.close()
-    
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'word_id': word_id})
 
-@app.route('/api/save_phrasal', methods=['POST'])
-def api_save_phrasal():
-    data = request.get_json()
-    verb = data.get('verb', '')
-    prepositions = data.get('prepositions', '')
-    russian = data.get('russian', '')
-    user_id = data.get('user_id', 0)
-    
-    if not verb or not prepositions or not russian or not user_id:
-        return jsonify({'success': False}), 400
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO phrasal_verbs (verb, prepositions, russian, user_id) VALUES (%s, %s, %s, %s)",
-        (verb, prepositions, russian, user_id)
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    return jsonify({'success': True})
-
-@app.route('/api/get_all_words', methods=['GET'])
-def api_get_all_words():
+@app.route('/api/words/<int:word_id>', methods=['DELETE'])
+def delete_word(word_id):
     user_id = request.args.get('user_id', 0)
-    if not user_id or user_id == '0':
-        return jsonify({'words': [], 'phrasal_verbs': []})
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT id, english, russian, comment FROM words WHERE user_id = %s ORDER BY id DESC", (user_id,))
-    words = cur.fetchall()
-    cur.execute("SELECT id, verb, prepositions, russian FROM phrasal_verbs WHERE user_id = %s ORDER BY id DESC", (user_id,))
-    phrasal = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    return jsonify({'words': words, 'phrasal_verbs': phrasal})
-
-@app.route('/api/delete_word', methods=['POST'])
-def api_delete_word():
-    data = request.get_json()
-    word_id = data.get('word_id', 0)
-    user_id = data.get('user_id', 0)
-    
-    if not word_id or not user_id:
+    if not user_id:
         return jsonify({'success': False}), 400
     
     conn = get_db_connection()
@@ -145,16 +227,65 @@ def api_delete_word():
     conn.commit()
     cur.close()
     conn.close()
-    
     return jsonify({'success': True})
 
-@app.route('/api/delete_phrasal', methods=['POST'])
-def api_delete_phrasal():
+@app.route('/api/words/<int:word_id>/move', methods=['PUT'])
+def move_word(word_id):
     data = request.get_json()
-    verb_id = data.get('verb_id', 0)
+    folder_id = data.get('folder_id')
     user_id = data.get('user_id', 0)
     
-    if not verb_id or not user_id:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE words SET folder_id = %s WHERE id = %s AND user_id = %s", (folder_id, word_id, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True})
+
+@app.route('/api/words/<int:word_id>/comment', methods=['PUT'])
+def update_comment(word_id):
+    data = request.get_json()
+    comment = data.get('comment', '')
+    user_id = data.get('user_id', 0)
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE words SET comment = %s WHERE id = %s AND user_id = %s", (comment, word_id, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True})
+
+# --- API ФРАЗОВЫЕ ГЛАГОЛЫ ---
+@app.route('/api/phrasal', methods=['POST'])
+def save_phrasal():
+    data = request.get_json()
+    verb = data.get('verb', '')
+    prepositions = data.get('prepositions', '')
+    russian = data.get('russian', '')
+    folder_id = data.get('folder_id')
+    user_id = data.get('user_id', 0)
+    
+    if not verb or not prepositions or not russian or not user_id:
+        return jsonify({'success': False}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO phrasal_verbs (verb, prepositions, russian, folder_id, user_id) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        (verb, prepositions, russian, folder_id, user_id)
+    )
+    verb_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True, 'verb_id': verb_id})
+
+@app.route('/api/phrasal/<int:verb_id>', methods=['DELETE'])
+def delete_phrasal(verb_id):
+    user_id = request.args.get('user_id', 0)
+    if not user_id:
         return jsonify({'success': False}), 400
     
     conn = get_db_connection()
@@ -163,32 +294,14 @@ def api_delete_phrasal():
     conn.commit()
     cur.close()
     conn.close()
-    
     return jsonify({'success': True})
 
-@app.route('/api/update_comment', methods=['POST'])
-def api_update_comment():
-    data = request.get_json()
-    word_id = data.get('word_id', 0)
-    comment = data.get('comment', '')
-    user_id = data.get('user_id', 0)
-    
-    if not word_id or not user_id:
-        return jsonify({'success': False}), 400
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE words SET comment = %s WHERE id = %s AND user_id = %s", (comment, word_id, user_id))
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    return jsonify({'success': True})
-
-@app.route('/api/get_test_data', methods=['GET'])
-def api_get_test_data():
+# --- API ТЕСТ ---
+@app.route('/api/test', methods=['GET'])
+def get_test_data():
     user_id = request.args.get('user_id', 0)
     test_type = request.args.get('type', 'mixed')
+    folder_id = request.args.get('folder_id', '')
     
     if not user_id:
         return jsonify({'items': []})
@@ -199,7 +312,10 @@ def api_get_test_data():
     items = []
     
     if test_type in ['en_ru', 'ru_en', 'mixed']:
-        cur.execute("SELECT * FROM words WHERE user_id = %s", (user_id,))
+        if folder_id and folder_id != 'null' and folder_id != 'undefined':
+            cur.execute("SELECT * FROM words WHERE user_id = %s AND folder_id = %s", (user_id, folder_id))
+        else:
+            cur.execute("SELECT * FROM words WHERE user_id = %s", (user_id,))
         words = cur.fetchall()
         for w in words:
             items.append({
@@ -207,11 +323,15 @@ def api_get_test_data():
                 'id': w['id'],
                 'english': w['english'],
                 'russian': w['russian'],
-                'comment': w['comment']
+                'comment': w['comment'],
+                'folder_id': w['folder_id']
             })
     
     if test_type in ['phrasal', 'mixed']:
-        cur.execute("SELECT * FROM phrasal_verbs WHERE user_id = %s", (user_id,))
+        if folder_id and folder_id != 'null' and folder_id != 'undefined':
+            cur.execute("SELECT * FROM phrasal_verbs WHERE user_id = %s AND folder_id = %s", (user_id, folder_id))
+        else:
+            cur.execute("SELECT * FROM phrasal_verbs WHERE user_id = %s", (user_id,))
         verbs = cur.fetchall()
         for v in verbs:
             items.append({
@@ -219,7 +339,8 @@ def api_get_test_data():
                 'id': v['id'],
                 'verb': v['verb'],
                 'prepositions': v['prepositions'],
-                'russian': v['russian']
+                'russian': v['russian'],
+                'folder_id': v['folder_id']
             })
     
     cur.close()
@@ -232,10 +353,6 @@ def api_get_test_data():
 def health():
     return "OK", 200
 
-@app.route('/')
-def index():
-    return "English Bot API is running!", 200
-
 # --- Telegram бот ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(
@@ -247,29 +364,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-def run_flask():
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"Flask запущен на порту {port}")
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-
-def main():
+def run_bot():
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
         logger.error("Токен не найден!")
         return
     
     init_db()
-    
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Запускаем бота в главном потоке
     app_telegram = Application.builder().token(TOKEN).build()
     app_telegram.add_handler(CommandHandler("start", start))
-    
     logger.info("Бот запущен!")
     app_telegram.run_polling()
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=run_bot, daemon=True).start()
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
