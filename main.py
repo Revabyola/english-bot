@@ -27,7 +27,7 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Таблица папок/тем
+    # Таблица папок
     cur.execute("""
         CREATE TABLE IF NOT EXISTS folders (
             id SERIAL PRIMARY KEY,
@@ -38,17 +38,29 @@ def init_db():
         );
     """)
     
-    # Таблица слов с привязкой к папке
+    # Таблица слов (создаём, если нет)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS words (
             id SERIAL PRIMARY KEY,
             english TEXT NOT NULL,
             russian TEXT NOT NULL,
             comment TEXT,
-            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
             user_id BIGINT NOT NULL
         );
     """)
+    
+    # Проверяем, есть ли колонка folder_id в words
+    cur.execute("""
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name='words' AND column_name='folder_id'
+    """)
+    if not cur.fetchone():
+        cur.execute("""
+            ALTER TABLE words 
+            ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL
+        """)
+        logger.info("Колонка folder_id добавлена в таблицу words")
     
     # Таблица фразовых глаголов
     cur.execute("""
@@ -57,14 +69,27 @@ def init_db():
             verb TEXT NOT NULL,
             prepositions TEXT NOT NULL,
             russian TEXT NOT NULL,
-            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
             user_id BIGINT NOT NULL
         );
     """)
     
+    # Проверяем, есть ли колонка folder_id в phrasal_verbs
+    cur.execute("""
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name='phrasal_verbs' AND column_name='folder_id'
+    """)
+    if not cur.fetchone():
+        cur.execute("""
+            ALTER TABLE phrasal_verbs 
+            ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL
+        """)
+        logger.info("Колонка folder_id добавлена в таблицу phrasal_verbs")
+    
     conn.commit()
     cur.close()
     conn.close()
+    logger.info("База данных инициализирована")
 
 def translate_word(word):
     translations = []
