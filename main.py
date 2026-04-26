@@ -288,6 +288,47 @@ def get_test_data():
     random.shuffle(items)
     return jsonify({'items': items})
 
+# --- API копирования слов ---
+@app.route('/api/copy_words', methods=['POST'])
+def copy_words():
+    data = request.get_json()
+    from_user = data.get('from_user')
+    to_user = data.get('to_user')
+    
+    if not from_user or not to_user:
+        return jsonify({'error': 'Missing user IDs'}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Копируем слова
+    cur.execute("""
+        INSERT INTO words (english, russian, comment, user_id)
+        SELECT english, russian, comment, %s
+        FROM words
+        WHERE user_id = %s
+    """, (to_user, from_user))
+    words_copied = cur.rowcount
+    
+    # Копируем фразовые глаголы
+    cur.execute("""
+        INSERT INTO phrasal_verbs (verb, prepositions, russian, user_id)
+        SELECT verb, prepositions, russian, %s
+        FROM phrasal_verbs
+        WHERE user_id = %s
+    """, (to_user, from_user))
+    phrasal_copied = cur.rowcount
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    return jsonify({
+        'success': True,
+        'words_copied': words_copied,
+        'phrasal_copied': phrasal_copied
+    })
+
 @app.route('/health')
 def health():
     return "OK", 200
@@ -303,13 +344,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-def main():
-    if not TOKEN:
-        logger.error("Токен не найден!")
-        return
-    
-    init_db()
-    
+if __name__ == "__main__":
     # Запускаем Flask в отдельном потоке
     def run_flask():
         port = int(os.environ.get('PORT', 10000))
@@ -320,11 +355,11 @@ def main():
     flask_thread.start()
     
     # Запускаем бота в главном потоке
-    app_telegram = Application.builder().token(TOKEN).build()
-    app_telegram.add_handler(CommandHandler("start", start))
-    
-    logger.info("Бот запущен!")
-    app_telegram.run_polling()
-
-if __name__ == "__main__":
-    main()
+    if TOKEN:
+        init_db()
+        app_telegram = Application.builder().token(TOKEN).build()
+        app_telegram.add_handler(CommandHandler("start", start))
+        logger.info("Бот запущен!")
+        app_telegram.run_polling()
+    else:
+        logger.error("Токен не найден!")
