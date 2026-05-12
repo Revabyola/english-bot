@@ -92,15 +92,60 @@ def init_db():
     logger.info("База данных инициализирована")
 
 def translate_word(word):
+    """Переводит слово через Google Translate с разными частями речи."""
     translations = []
     translator = GoogleTranslator(source='en', target='ru')
+    
+    # 1. Просто слово
     try:
         result = translator.translate(word)
-        if result:
+        if result and result.lower() not in translations:
             translations.append(result.lower())
     except:
         pass
-    return translations[:6] if translations else []
+    
+    # 2. Как глагол (to + слово)
+    try:
+        result = translator.translate(f"to {word}")
+        if result and result.lower() not in translations:
+            translations.append(result.lower())
+    except:
+        pass
+    
+    # 3. Как существительное (a + слово)
+    try:
+        result = translator.translate(f"a {word}")
+        if result and result.lower() not in translations:
+            translations.append(result.lower())
+    except:
+        pass
+    
+    # 4. Множественное число
+    try:
+        result = translator.translate(f"{word}s")
+        if result and result.lower() not in translations:
+            translations.append(result.lower())
+    except:
+        pass
+    
+    # 5. Синонимы через Datamuse API
+    try:
+        url = f"https://api.datamuse.com/words?rel_syn={word}&max=3"
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            for syn in response.json()[:3]:
+                syn_word = syn.get('word', '')
+                if syn_word and syn_word != word:
+                    try:
+                        syn_trans = translator.translate(syn_word)
+                        if syn_trans and syn_trans.lower() not in translations:
+                            translations.append(syn_trans.lower())
+                    except:
+                        pass
+    except:
+        pass
+    
+    return list(dict.fromkeys(translations))[:7]  # До 7 вариантов
 
 # --- API ПАПКИ ---
 @app.route('/api/folders', methods=['GET'])
