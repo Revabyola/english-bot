@@ -155,6 +155,30 @@ def delete_folder(folder_id):
     conn.close()
     return jsonify({'success': True})
 
+# --- 🆕 ПЕРЕИМЕНОВАНИЕ ПАПКИ ---
+@app.route('/api/folders/<int:folder_id>/rename', methods=['PUT'])
+def rename_folder(folder_id):
+    data = request.get_json()
+    new_name = data.get('name', '').strip()
+    user_id = data.get('user_id', 0)
+    
+    if not new_name or not user_id:
+        return jsonify({'success': False}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE folders SET name = %s WHERE id = %s AND user_id = %s",
+            (new_name, folder_id, user_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # --- API ПЕРЕВОД ---
 @app.route('/api/translate', methods=['GET'])
 def api_translate():
